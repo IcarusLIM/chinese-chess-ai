@@ -1,0 +1,11 @@
+# 中国象棋 AI - Python 依赖
+# 安装: pip install -r requirements.txt
+
+# 深度学习框架（CUDA 12.x 版本）
+torch>=2.1.0
+
+# Web 服务器
+flask>=3.0.0
+
+# 数据处理
+numpy>=1.24.0
