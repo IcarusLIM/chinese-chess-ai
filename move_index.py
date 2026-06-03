@@ -146,7 +146,7 @@ def generate_all_moves() -> List[Tuple[int, int, int, int]]:
 
             if fr <= 6 and fr >= 1:  # 黑卒（未过河）
                 add(fr, fc, fr - 1, fc)  # 前进（行号减小）
-            if fr <= 4:  # 黑卒（未过河）
+            if fr <= 4:  # 黑卒（已过河）
                 add(fr, fc, fr, fc - 1)  # 左
                 add(fr, fc, fr, fc + 1)  # 右
     

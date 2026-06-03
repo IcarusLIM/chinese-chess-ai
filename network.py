@@ -83,8 +83,8 @@ class PolicyValueNet(nn.Module):
     """
     策略-价值网络
     
-    输入：棋盘状态张量 [batch, 14, 10, 9]
-      - 14 个通道：红方7种棋子 + 黑方7种棋子
+    输入：棋盘状态张量 [batch, 15, 10, 9]
+      - 15 个通道：红方7种棋子 + 黑方7种棋子 + 当前走棋方
       - 每个通道是该种棋子的位置热力图
     
     输出：
@@ -92,7 +92,7 @@ class PolicyValueNet(nn.Module):
       - value: [batch, 1] 局面评估值 [-1, 1]
     
     网络结构：
-      输入(14通道) → Conv2d(256) → ResBlock×10 → 
+      输入(15通道) → Conv2d(256) → ResBlock×10 →
         ├→ 策略头: Conv(32) → FC(num_moves) → policy
         └→ 价值头: Conv(3) → FC(256) → FC(1) → tanh → value
     """
@@ -110,9 +110,9 @@ class PolicyValueNet(nn.Module):
         self.num_moves = mi.num_moves
         
         # === 输入层 ===
-        # 将 14 通道的棋盘状态映射到高维特征空间
+        # 将 15 通道的棋盘状态映射到高维特征空间（14 棋子 + 1 走棋方）
         self.input_conv = nn.Sequential(
-            nn.Conv2d(14, channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(15, channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(),
         )
@@ -152,7 +152,7 @@ class PolicyValueNet(nn.Module):
         前向传播。
         
         Args:
-            x: 棋盘状态张量 [batch, 14, 10, 9]
+            x: 棋盘状态张量 [batch, 15, 10, 9]
             
         Returns:
             (policy, value):
@@ -176,7 +176,7 @@ class PolicyValueNet(nn.Module):
         单个局面的推理接口（不使用 DataLoader）。
         
         Args:
-            board_tensor: 14×10×9 的三维列表（来自 Game.get_board_tensor()）
+            board_tensor: 15×10×9 的三维列表（来自 Game.get_board_tensor()）
             
         Returns:
             (policy_probs, value):

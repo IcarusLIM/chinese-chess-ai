@@ -242,10 +242,10 @@ class Game:
             (1, -2, 0, -1), (1, 2, 0, 1),       # 左右下
         ]
         for dr, dc, leg_dr, leg_dc in knight_attacks:
-            r, c = tr + dr, tc + dc
+            r, c = tr - dr, tc - dc
             if self.in_board(r, c) and self.board[r][c] == knight_piece:
                 # 检查蹩马腿
-                leg_r, leg_c = tr + leg_dr, tc + leg_dc
+                leg_r, leg_c = r + leg_dr, c + leg_dc
                 if self.board[leg_r][leg_c] == EMPTY:
                     return True
         return False
@@ -747,25 +747,30 @@ class Game:
     def get_board_tensor(self) -> 'list':
         """
         将棋盘状态编码为神经网络输入格式。
-        
-        使用 14 个通道（plane），每个通道是一个 10x9 的二值矩阵：
-        - 通道 0-6：红方的 帅、仕、相、马、车、炮、兵
-        - 通道 7-13：黑方的 将、士、象、马、车、炮、卒
-        
-        每个通道中，对应棋子的位置为 1，其余为 0。
-        
+
+        使用 15 个通道（plane），每个通道是一个 10x9 的矩阵：
+        - 通道 0-6：红方的 帅、仕、相、马、车、炮、兵（二值）
+        - 通道 7-13：黑方的 将、士、象、马、车、炮、卒（二值）
+        - 通道 14：当前走棋方（红方走棋全 1，黑方走棋全 0）
+
         Returns:
-            14x10x9 的三维列表
+            15x10x9 的三维列表
         """
-        tensor = [[[0.0] * BOARD_COLS for _ in range(BOARD_ROWS)] for _ in range(14)]
-        
+        tensor = [[[0.0] * BOARD_COLS for _ in range(BOARD_ROWS)] for _ in range(15)]
+
         for row in range(BOARD_ROWS):
             for col in range(BOARD_COLS):
                 piece = self.board[row][col]
                 if piece != EMPTY:
                     channel = piece - 1  # 编码 1-14 → 通道 0-13
                     tensor[channel][row][col] = 1.0
-        
+
+        # 第 15 通道：当前走棋方
+        turn_value = 1.0 if self.red_to_move else 0.0
+        for row in range(BOARD_ROWS):
+            for col in range(BOARD_COLS):
+                tensor[14][row][col] = turn_value
+
         return tensor
     
     def copy(self) -> 'Game':
@@ -779,26 +784,39 @@ class Game:
         new_game.halfmove_clock = self.halfmove_clock
         new_game.fullmove_number = self.fullmove_number
         return new_game
-    
-    def get_material_balance(self) -> float:
+
+    def evaluate_material_normalized(self) -> float:
         """
-        计算物质平衡值（红方物质 - 黑方物质）。
-        用于简单局面评估。
+        归一化的材料评估，用于混合评估信号。
+
+        排除将/帅（始终存在），将材料差归一化到 [-1, 1]。
+        返回值从当前走棋方视角：正数表示当前方优势。
+
+        Returns:
+            float: [-1, 1] 的局面评估值
         """
+        # 初始非将子力总值（双方各 480，共 960）
+        INITIAL_MATERIAL_NO_KING = 960
+
         balance = 0.0
         for row in range(BOARD_ROWS):
             for col in range(BOARD_COLS):
                 piece = self.board[row][col]
-                if piece != EMPTY:
+                if piece != EMPTY and piece not in (R_KING, B_KING):
                     value = PIECE_VALUES.get(piece, 0)
                     # 兵过河后价值提升
-                    if piece == R_PAWN and row <= 4:
-                        value = PAWN_VALUE_CROSSED_RIVER
-                    elif piece == B_PAWN and row >= 5:
-                        value = PAWN_VALUE_CROSSED_RIVER
-                    
+                    if piece == R_PAWN and row >= 5:
+                        value += PAWN_VALUE_CROSSED_RIVER
+                    elif piece == B_PAWN and row <= 4:
+                        value += PAWN_VALUE_CROSSED_RIVER
+
                     if piece in RED_PIECES:
                         balance += value
                     else:
                         balance -= value
-        return balance
+
+        # 归一化到 [-1, 1]
+        normalized = max(-1.0, min(1.0, balance / INITIAL_MATERIAL_NO_KING))
+
+        # 从当前走棋方视角返回
+        return normalized if self.red_to_move else -normalized

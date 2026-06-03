@@ -148,12 +148,13 @@ class MCTS:
     - 对弈时：选择访问次数最多的走法
     """
     
-    def __init__(self, 
+    def __init__(self,
                  model: PolicyValueNet,
                  num_simulations: int = 400,
                  c_puct: float = 1.5,
                  dirichlet_alpha: float = 0.3,
-                 dirichlet_epsilon: float = 0.25):
+                 dirichlet_epsilon: float = 0.25,
+                 material_weight: float = 0.0):
         """
         Args:
             model: 策略-价值网络
@@ -167,12 +168,14 @@ class MCTS:
                 - 3.0: 较激进的探索
             dirichlet_alpha: Dirichlet 噪声参数（控制探索）
             dirichlet_epsilon: 噪声混合比例
+            material_weight: 材料评估混合权重（0.0=纯网络，1.0=纯材料评估）
         """
         self.model = model
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
+        self.material_weight = material_weight
         self.move_index = get_move_index()
     
     def search(self, game: Game, temperature: float = 1.0) -> Tuple[int, List[float]]:
@@ -261,13 +264,13 @@ class MCTS:
             node: 当前节点
         """
         # 选择阶段：沿树向下选择直到叶节点
-        search_path = [(node, -1)]  # (node, move_idx)
+        search_path = [(node, -1)]
         current_game = game.copy()
-        
+
         while node.is_expanded and node.children:
             move_idx, node = node.select_child(self.c_puct, sum(node.N.values()) if node.N else 0)
             search_path.append((node, move_idx))
-            
+
             # 在模拟棋盘上执行走子
             move = self.move_index.index_to_move(move_idx)
             if move is None:
@@ -279,17 +282,23 @@ class MCTS:
         is_over, result = current_game.is_game_over()
         
         if is_over:
-            # 游戏结束，直接回传结果
+            # 游戏结束，从当前走棋方视角返回
             if result == 'red_wins':
-                value = 1.0
+                value = 1.0 if current_game.red_to_move else -1.0
             elif result == 'black_wins':
-                value = -1.0
+                value = -1.0 if current_game.red_to_move else 1.0
             else:
                 value = 0.0
         else:
-            # 未结束，用神经网络评估
+            # 未结束，用神经网络评估（可选混合材料评估）
             board_tensor = current_game.get_board_tensor()
-            policy_probs, value = self.model.predict(board_tensor)
+            policy_probs, network_value = self.model.predict(board_tensor)
+
+            if self.material_weight > 0:
+                material_value = current_game.evaluate_material_normalized()
+                value = (1 - self.material_weight) * network_value + self.material_weight * material_value
+            else:
+                value = network_value
             
             # 扩展叶节点
             legal_moves = current_game.get_legal_moves()
@@ -309,19 +318,16 @@ class MCTS:
                 node.expand(legal_indices, legal_priors)
         
         # 回溯阶段：沿路径回传价值
-        # search_path[i] = (node, move_idx)，其中 move_idx 是到达该节点的走法
-        # 该走法是由 search_path[i-1]（父节点）执行的，所以应更新父节点的统计
-        root_is_red = game.red_to_move
-        for i in range(len(search_path) - 1, -1, -1):
-            node, move_idx = search_path[i]
-            if move_idx >= 0:
-                parent_node = search_path[i - 1][0]
-                # 走法由父节点执行，判断父节点的走棋方
-                parent_is_red = root_is_red if (i - 1) % 2 == 0 else not root_is_red
-                if parent_is_red:
-                    parent_node.backup(move_idx, value)
-                else:
-                    parent_node.backup(move_idx, -value)
+        # value 为叶节点走棋方视角，走子交替，到叶节点的
+        # 距离为偶数 → 同色 → 用 value，奇数 → 异色 → 用 -value
+        depth = len(search_path) - 1  # 叶节点深度
+        for i in range(depth, 0, -1):
+            _, move_idx = search_path[i]
+            parent_node, _ = search_path[i - 1]
+            if (depth - i + 1) % 2 == 0:
+                parent_node.backup(move_idx, value)
+            else:
+                parent_node.backup(move_idx, -value)
     
     def _compute_policy(self, root: MCTSNode, temperature: float) -> List[float]:
         """

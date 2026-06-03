@@ -7,11 +7,13 @@
   - play:  控制台对弈（调试用）
 
 用法：
-  python main.py train                    # 从零开始训练
-  python main.py train --iterations 50    # 训练50轮
-  python main.py web                      # 启动 Web 界面
-  python main.py web --model models/latest_model.pt  # 加载模型后启动
-  python main.py play                     # 控制台对弈
+  python main.py train                                        # 从零开始训练
+  python main.py train --material-warmup 80                   # 启用材料评估 warmup
+  python main.py train --resume models/latest_model.pt        # 从 checkpoint 续训
+  python main.py train --iterations 50                        # 训练50轮
+  python main.py web                                          # 启动 Web 界面
+  python main.py web --model models/latest_model.pt           # 加载模型后启动
+  python main.py play                                         # 控制台对弈
 """
 
 import argparse
@@ -39,8 +41,11 @@ def cmd_train(args):
         batch_size=args.batch_size,
         learning_rate=args.lr,
         save_dir=args.save_dir,
+        resume_from=args.resume,
+        load_buffer=args.load_buffer,
+        material_warmup=args.material_warmup,
     )
-    
+
     pipeline.run(num_iterations=args.iterations)
 
 
@@ -136,11 +141,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：
-  python main.py train                          # 从零开始训练
-  python main.py train --iterations 50 --blocks 5  # 快速训练
-  python main.py web                            # 启动 Web 界面
-  python main.py web --model models/latest_model.pt  # 带模型启动
-  python main.py play                           # 控制台对弈
+  python main.py train                                        # 从零开始训练
+  python main.py train --material-warmup 80                   # 启用 80 轮材料评估 warmup
+  python main.py train --resume models/latest_model.pt        # 从 checkpoint 续训
+  python main.py train --iterations 50 --blocks 5             # 快速训练
+  python main.py web                                          # 启动 Web 界面
+  python main.py web --model models/latest_model.pt           # 带模型启动
+  python main.py play                                         # 控制台对弈
         """
     )
     
@@ -157,6 +164,9 @@ def main():
     train_parser.add_argument('--batch-size', type=int, default=256, help='训练批大小')
     train_parser.add_argument('--lr', type=float, default=0.001, help='学习率')
     train_parser.add_argument('--save-dir', type=str, default='models', help='模型保存目录')
+    train_parser.add_argument('--resume', type=str, default=None, help='从指定 checkpoint 继续训练')
+    train_parser.add_argument('--load-buffer', type=str, default=None, help='从指定文件加载 replay buffer')
+    train_parser.add_argument('--material-warmup', type=int, default=0, help='材料评估 warmup 迭代数（0=不启用）')
     
     # === web 子命令 ===
     web_parser = subparsers.add_parser('web', help='Web 对弈界面')

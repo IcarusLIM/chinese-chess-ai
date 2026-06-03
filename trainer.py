@@ -31,6 +31,8 @@
 import os
 import time
 import random
+import copy
+import pickle
 import numpy as np
 import torch
 import torch.nn as nn
@@ -51,7 +53,7 @@ class GameDataset(Dataset):
     棋局数据集
     
     存储自对弈产生的训练样本，每个样本包含：
-    - board_tensor: 棋盘状态 [14, 10, 9]
+    - board_tensor: 棋盘状态 [15, 10, 9]
     - policy: MCTS 策略分布 [num_moves]
     - value: 游戏结果（+1 红胜, -1 黑胜, 0 和棋）
     """
@@ -83,22 +85,25 @@ class SelfPlayWorker:
     使用 MCTS 搜索选择走法，记录每步的训练样本。
     """
     
-    def __init__(self, 
+    def __init__(self,
                  model: PolicyValueNet,
                  num_simulations: int = 400,
                  max_moves: int = 200,
-                 temperature_threshold: int = 30):
+                 temperature_threshold: int = 30,
+                 material_weight: float = 0.0):
         """
         Args:
             model: 当前模型
             num_simulations: MCTS 模拟次数
             max_moves: 每局最大走子数（超过判和）
             temperature_threshold: 走子数超过此值后温度降为 0.01
+            material_weight: MCTS 叶节点材料评估混合权重
         """
         self.model = model
         self.num_simulations = num_simulations
         self.max_moves = max_moves
         self.temperature_threshold = temperature_threshold
+        self.material_weight = material_weight
         self.move_index = get_move_index()
     
     def play_one_game(self) -> List[Tuple]:
@@ -110,7 +115,8 @@ class SelfPlayWorker:
             其中 value 是最终游戏结果（从红方视角）
         """
         game = Game()
-        mcts = MCTS(self.model, num_simulations=self.num_simulations)
+        mcts = MCTS(self.model, num_simulations=self.num_simulations,
+                    material_weight=self.material_weight)
         
         # 存储每一步的数据
         states = []    # 棋盘状态
@@ -343,26 +349,33 @@ class Trainer:
         torch.save(checkpoint, path)
         print(f"[训练] 检查点已保存: {path}")
     
-    def load_checkpoint(self, path: str) -> int:
+    def load_checkpoint(self, path: str) -> dict:
         """
         加载模型检查点。
-        
+
         Args:
             path: 检查点文件路径
-            
+
         Returns:
-            加载的 epoch 编号
+            checkpoint 中的 additional_info 字典（包含 iteration 等）
         """
         checkpoint = torch.load(path, map_location='cuda')
-        
+
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.training_history = checkpoint.get('training_history', [])
-        
+
         epoch = checkpoint['epoch']
         print(f"[训练] 检查点已加载: {path} (epoch {epoch})")
-        return epoch
+
+        # 返回额外信息（包含 iteration 等）
+        additional = {}
+        for key, value in checkpoint.items():
+            if key not in ('model_state_dict', 'optimizer_state_dict',
+                           'scheduler_state_dict', 'training_history', 'epoch'):
+                additional[key] = value
+        return additional
 
 
 class ModelEvaluator:
@@ -472,7 +485,7 @@ class TrainingPipeline:
     整合自对弈、训练、评估的完整流程。
     """
     
-    def __init__(self, 
+    def __init__(self,
                  num_blocks: int = 10,
                  channels: int = 256,
                  num_simulations: int = 400,
@@ -482,7 +495,10 @@ class TrainingPipeline:
                  learning_rate: float = 0.001,
                  buffer_size: int = 100000,
                  evaluate_every: int = 5,
-                 save_dir: str = 'models'):
+                 save_dir: str = 'models',
+                 resume_from: str = None,
+                 load_buffer: str = None,
+                 material_warmup: int = 0):
         """
         Args:
             num_blocks: 残差块数量
@@ -495,6 +511,9 @@ class TrainingPipeline:
             buffer_size: 经验回放缓冲区大小
             evaluate_every: 每隔多少轮评估一次
             save_dir: 模型保存目录
+            resume_from: 从指定 checkpoint 继续训练
+            load_buffer: 从指定文件加载 replay buffer
+            material_warmup: 材料评估 warmup 迭代数（0=不启用）
         """
         self.num_blocks = num_blocks
         self.channels = channels
@@ -506,31 +525,92 @@ class TrainingPipeline:
         self.buffer_size = buffer_size
         self.evaluate_every = evaluate_every
         self.save_dir = save_dir
-        
+        self.material_warmup = material_warmup
+        self.start_iteration = 1
+
         # 创建保存目录
         os.makedirs(save_dir, exist_ok=True)
-        
+
         # 初始化模型
         self.model = create_model(num_blocks, channels, device='cuda')
-        
+
+        # 训练器（需要在 resume 之前创建，以便加载优化器状态）
+        self.trainer = Trainer(self.model, learning_rate=learning_rate)
+
+        # 断点续训：加载 checkpoint
+        if resume_from and os.path.exists(resume_from):
+            additional = self.trainer.load_checkpoint(resume_from)
+            if isinstance(additional, dict):
+                self.start_iteration = additional.get('iteration', 1) + 1
+            print(f"[训练] 从迭代 {self.start_iteration} 继续训练")
+
         # 经验回放缓冲区
         self.replay_buffer = deque(maxlen=buffer_size)
-        
-        # 自对弈工作器
+
+        # 加载 replay buffer
+        buffer_loaded = False
+        if load_buffer and os.path.exists(load_buffer):
+            self._load_replay_buffer(load_buffer)
+            buffer_loaded = True
+        elif resume_from:
+            # 自动查找同目录下的 replay_buffer.pkl
+            auto_buffer = os.path.join(os.path.dirname(resume_from), 'replay_buffer.pkl')
+            if os.path.exists(auto_buffer):
+                self._load_replay_buffer(auto_buffer)
+                buffer_loaded = True
+
+        if not buffer_loaded:
+            print(f"[训练] replay buffer 为空，从零开始收集数据")
+
+        # 自对弈工作器（material_weight 在 run() 中动态设置）
         self.self_play_worker = SelfPlayWorker(
             self.model, num_simulations=num_simulations
         )
-        
-        # 训练器
-        self.trainer = Trainer(self.model, learning_rate=learning_rate)
-        
+
         # 评估器
         self.evaluator = ModelEvaluator(num_games=20, num_simulations=num_simulations)
-    
+
+    def _save_replay_buffer(self):
+        """将 replay buffer 保存到磁盘。"""
+        buffer_path = os.path.join(self.save_dir, 'replay_buffer.pkl')
+        try:
+            with open(buffer_path, 'wb') as f:
+                pickle.dump(list(self.replay_buffer), f)
+            print(f"[训练] replay buffer 已保存: {buffer_path} ({len(self.replay_buffer)} 条样本)")
+        except Exception as e:
+            print(f"[训练] replay buffer 保存失败: {e}")
+
+    def _load_replay_buffer(self, path: str):
+        """从磁盘加载 replay buffer。"""
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+            self.replay_buffer.extend(data)
+            print(f"[训练] replay buffer 已加载: {path} ({len(self.replay_buffer)} 条样本)")
+        except Exception as e:
+            print(f"[训练] replay buffer 加载失败: {e}")
+
+    def _get_material_weight(self, iteration: int) -> float:
+        """
+        根据当前迭代计算材料评估混合权重。
+
+        Args:
+            iteration: 当前迭代编号（从 1 开始）
+
+        Returns:
+            material_weight: 0.0（纯网络）到 1.0（纯材料评估）
+        """
+        if self.material_warmup <= 0:
+            return 0.0
+        if iteration >= self.material_warmup:
+            return 0.0
+        # 线性衰减：从 1.0 衰减到 0.0
+        return 1.0 - (iteration - 1) / self.material_warmup
+
     def run(self, num_iterations: int = 100):
         """
         运行完整的训练流程。
-        
+
         Args:
             num_iterations: 训练迭代次数
         """
@@ -544,17 +624,27 @@ class TrainingPipeline:
         print(f"  训练批大小: {self.batch_size}")
         print(f"  学习率: {self.learning_rate}")
         print(f"  总迭代次数: {num_iterations}")
+        if self.material_warmup > 0:
+            print(f"  材料评估 warmup: {self.material_warmup} 轮")
         print("=" * 60)
-        
-        for iteration in range(1, num_iterations + 1):
+
+        # 记录上次评估通过时的状态（用于评估失败时回滚）
+        accepted_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+        accepted_optimizer_state = copy.deepcopy(self.trainer.optimizer.state_dict())
+        accepted_scheduler_state = copy.deepcopy(self.trainer.scheduler.state_dict())
+
+        for iteration in range(self.start_iteration, num_iterations + 1):
             print(f"\n{'='*60}")
             print(f"迭代 {iteration}/{num_iterations}")
             print(f"{'='*60}")
-            
+
             start_time = time.time()
 
-            # 保存训练前的模型权重（用于后续评估对比）
-            old_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+            # 动态设置材料评估权重
+            material_weight = self._get_material_weight(iteration)
+            self.self_play_worker.material_weight = material_weight
+            if material_weight > 0:
+                print(f"  材料评估权重: {material_weight:.2f}")
 
             # 步骤1：自对弈生成训练数据
             print("\n[步骤1] 自对弈中...")
@@ -587,29 +677,40 @@ class TrainingPipeline:
             # 步骤3：评估新模型
             if iteration % self.evaluate_every == 0:
                 print("\n[步骤3] 评估新模型...")
-                # 创建旧模型副本（使用训练前的权重）
+                # 创建旧模型副本（使用上次评估通过的权重）
                 old_model = create_model(self.num_blocks, self.channels, device='cuda')
-                old_model.load_state_dict(old_model_state)
-                
+                old_model.load_state_dict(accepted_model_state)
+
                 eval_result = self.evaluator.evaluate(self.model, old_model)
                 print(f"  胜率: {eval_result['win_rate']:.1%}")
                 print(f"  新模型胜: {eval_result['new_wins']}, "
                       f"旧模型胜: {eval_result['old_wins']}, "
                       f"和棋: {eval_result['draws']}")
-                
+
                 if eval_result['accepted']:
                     print("  ✅ 新模型已接受")
+                    # 更新 accepted 状态为当前模型
+                    accepted_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+                    accepted_optimizer_state = copy.deepcopy(self.trainer.optimizer.state_dict())
+                    accepted_scheduler_state = copy.deepcopy(self.trainer.scheduler.state_dict())
                 else:
-                    print("  ❌ 新模型未达标，保留旧模型")
+                    print("  ❌ 新模型未达标，回滚到上次通过的模型")
+                    self.model.load_state_dict(accepted_model_state)
+                    self.trainer.optimizer.load_state_dict(accepted_optimizer_state)
+                    self.trainer.scheduler.load_state_dict(accepted_scheduler_state)
             
             # 保存检查点
+            additional_info = {'iteration': iteration}
             if iteration % 5 == 0:
                 checkpoint_path = os.path.join(self.save_dir, f'checkpoint_iter_{iteration}.pt')
-                self.trainer.save_checkpoint(checkpoint_path, iteration)
-            
+                self.trainer.save_checkpoint(checkpoint_path, iteration, additional_info)
+
             # 保存最新模型
             latest_path = os.path.join(self.save_dir, 'latest_model.pt')
-            self.trainer.save_checkpoint(latest_path, iteration)
+            self.trainer.save_checkpoint(latest_path, iteration, additional_info)
+
+            # 保存 replay buffer
+            self._save_replay_buffer()
             
             elapsed = time.time() - start_time
             print(f"\n本轮耗时: {elapsed:.1f} 秒")
