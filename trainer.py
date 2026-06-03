@@ -148,7 +148,7 @@ class SelfPlayWorker:
             if move is None:
                 break
             fr, fc, tr, tc = move
-            game.make_move((fr, fc), (tr, tc))
+            game.make_move((fr, fc), (tr, tc), validate=False)
             move_count += 1
             
             # 检查游戏是否结束
@@ -265,10 +265,11 @@ class Trainer:
         num_batches = 0
         
         for batch_idx, (states, target_policies, target_values) in enumerate(dataloader):
-            # 移动到 GPU
-            states = states.cuda(non_blocking=True)
-            target_policies = target_policies.cuda(non_blocking=True)
-            target_values = target_values.cuda(non_blocking=True)
+            device = next(self.model.parameters()).device
+            # 移动到计算设备
+            states = states.to(device, non_blocking=True)
+            target_policies = target_policies.to(device, non_blocking=True)
+            target_values = target_values.to(device, non_blocking=True)
             
             # channels_last 内存格式
             states = states.to(memory_format=torch.channels_last)
@@ -276,8 +277,9 @@ class Trainer:
             # 清除梯度
             self.optimizer.zero_grad()
             
-            # 混合精度前向传播
-            with torch.amp.autocast('cuda'):
+            # 混合精度前向传播（仅 CUDA 启用）
+            use_amp = device.type == 'cuda'
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 policy_logits, value_pred = self.model(states)
                 
                 # 策略损失：交叉熵
@@ -293,14 +295,16 @@ class Trainer:
                 loss = policy_loss + value_loss
             
             # 混合精度反向传播
-            self.scaler.scale(loss).backward()
-            
-            # 梯度裁剪（防止梯度爆炸）
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            if use_amp:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
             
             # 累计损失
             total_loss += loss.item()
@@ -359,7 +363,8 @@ class Trainer:
         Returns:
             checkpoint 中的 additional_info 字典（包含 iteration 等）
         """
-        checkpoint = torch.load(path, map_location='cuda')
+        device = next(self.model.parameters()).device
+        checkpoint = torch.load(path, map_location=device)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -469,7 +474,7 @@ class ModelEvaluator:
                 return 'draw'
             
             fr, fc, tr, tc = move
-            game.make_move((fr, fc), (tr, tc))
+            game.make_move((fr, fc), (tr, tc), validate=False)
             
             is_over, result = game.is_game_over()
             if is_over:
@@ -532,7 +537,9 @@ class TrainingPipeline:
         os.makedirs(save_dir, exist_ok=True)
 
         # 初始化模型
-        self.model = create_model(num_blocks, channels, device='cuda')
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.model = create_model(num_blocks, channels, device=device)
+        self.device = device
 
         # 训练器（需要在 resume 之前创建，以便加载优化器状态）
         self.trainer = Trainer(self.model, learning_rate=learning_rate)
@@ -678,7 +685,7 @@ class TrainingPipeline:
             if iteration % self.evaluate_every == 0:
                 print("\n[步骤3] 评估新模型...")
                 # 创建旧模型副本（使用上次评估通过的权重）
-                old_model = create_model(self.num_blocks, self.channels, device='cuda')
+                old_model = create_model(self.num_blocks, self.channels, device=self.device)
                 old_model.load_state_dict(accepted_model_state)
 
                 eval_result = self.evaluator.evaluate(self.model, old_model)

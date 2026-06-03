@@ -258,7 +258,7 @@ if __name__ == '__main__':
     model = create_model(num_blocks=5, channels=128, device=device)
     
     # 模拟输入
-    dummy_input = torch.randn(1, 14, BOARD_ROWS, BOARD_COLS)
+    dummy_input = torch.randn(1, 15, BOARD_ROWS, BOARD_COLS)
     if device == 'cuda':
         dummy_input = dummy_input.cuda()
     dummy_input = dummy_input.to(memory_format=torch.channels_last)

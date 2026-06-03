@@ -128,7 +128,7 @@ def cmd_play(args):
             print("\nAI 思考中...")
             move = evaluator.select_move(game, temperature=0.01)
             if move:
-                game.make_move(*move)
+                game.make_move(*move, validate=False)
                 print(f"AI 走: {move[0]} → {move[1]}")
             else:
                 print("AI 无法走子")

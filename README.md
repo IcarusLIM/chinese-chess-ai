@@ -53,7 +53,7 @@ chinese-chess-ai/
 │   ├── app.py           # Flask Web 服务器
 │   └── templates/
 │       └── index.html   # 前端界面（棋盘 + 交互）
-├── models/              # 模型检查点保存目录
+├── models/              # 模型检查点（latest_model.pt、checkpoint_iter_*.pt、replay_buffer.pkl）
 ├── logs/                # 训练日志
 └── data/                # 训练数据
 ```
@@ -96,6 +96,57 @@ python main.py train --iterations 20 --blocks 5 --channels 128 --simulations 100
 # 训练完成后启动 Web 对弈
 python main.py web --model models/latest_model.pt
 ```
+
+### 断点续训
+
+训练过程中会自动保存检查点和经验回放数据：
+
+| 文件 | 说明 |
+|------|------|
+| `models/latest_model.pt` | 每轮迭代更新的最新模型 |
+| `models/checkpoint_iter_N.pt` | 每 5 轮保存的检查点 |
+| `models/replay_buffer.pkl` | 经验回放缓冲区（每轮自动保存） |
+
+从检查点继续训练：
+
+```bash
+# 加载模型、优化器状态，并从上次迭代编号 +1 继续
+python main.py train --resume models/latest_model.pt
+
+# 指定迭代次数（在已完成的迭代基础上继续）
+python main.py train --resume models/latest_model.pt --iterations 150
+```
+
+`--resume` 会自动尝试加载与检查点同目录下的 `replay_buffer.pkl`，无需手动指定。若 replay buffer 在其他路径，可单独加载：
+
+```bash
+python main.py train --resume models/latest_model.pt --load-buffer models/replay_buffer.pkl
+```
+
+仅加载 replay buffer、模型仍随机初始化（一般不推荐）：
+
+```bash
+python main.py train --load-buffer models/replay_buffer.pkl
+```
+
+### 材料评估 Warmup
+
+训练初期神经网络尚未收敛，MCTS 叶节点评估几乎随机。启用 `--material-warmup` 后，前 N 轮自对弈会在 MCTS 中混合**材料评估**（基于棋子价值的启发式）与网络评估，并随迭代线性衰减至纯网络评估：
+
+```
+叶节点价值 = (1 - w) × 网络评估 + w × 材料评估
+w = 1.0 → 0.0（第 1 轮到第 N 轮线性衰减，之后 w = 0）
+```
+
+```bash
+# 前 80 轮启用材料评估 warmup，帮助早期自对弈获得更合理的搜索信号
+python main.py train --material-warmup 80
+
+# 组合使用：从检查点续训 + warmup
+python main.py train --resume models/latest_model.pt --material-warmup 80
+```
+
+建议在新模型或长时间中断后重新训练时使用，典型值为 50–100 轮；模型已有一定棋力时可设为 `0`（默认，不启用）。
 
 ### 控制台对弈（调试用）
 
@@ -169,16 +220,20 @@ ResBlock × 10                  ← 10个残差块（特征提取）
 ```
 for 迭代 in range(100):
     1. 自对弈：当前模型 × 当前模型 → 生成训练数据
-    2. 训练：用训练数据更新神经网络
+       （可选：材料评估 warmup 混合启发式评估）
+    2. 训练：用经验回放缓冲区中的数据更新神经网络
     3. 评估：新模型 vs 旧模型对弈
        - 胜率 > 55% → 接受新模型
-       - 否则 → 保留旧模型
+       - 否则 → 回滚到上次通过的模型
+    4. 保存：latest_model.pt + replay_buffer.pkl
 ```
 
 训练损失函数：
 ```
 Loss = 策略损失(交叉熵) + 价值损失(MSE) + L2正则化
 ```
+
+每轮迭代结束后，`models/` 目录会更新 `latest_model.pt` 和 `replay_buffer.pkl`，支持通过 `--resume` 断点续训。
 
 ## 超参数说明
 
@@ -193,6 +248,9 @@ Loss = 策略损失(交叉熵) + 价值损失(MSE) + L2正则化
 | `learning_rate` | 0.001 | 初始学习率，随训练衰减 |
 | `c_puct` | 1.5 | MCTS 探索常数 |
 | `temperature` | 1.0→0.01 | 温度参数，训练时先高后低 |
+| `--resume` | — | 从指定 checkpoint 继续训练（恢复模型、优化器、迭代编号） |
+| `--load-buffer` | — | 从指定文件加载经验回放缓冲区 |
+| `--material-warmup` | 0 | 材料评估 warmup 轮数（0 = 不启用） |
 
 ## RTX 5070 训练建议
 
@@ -232,7 +290,17 @@ Loss = 策略损失(交叉熵) + 价值损失(MSE) + L2正则化
 减小 `num_simulations`（如 100）或使用更小的模型（blocks=5, channels=128）。
 
 **Q: 如何继续训练已有模型？**
-模型检查点自动保存在 `models/` 目录，加载后继续训练即可。
+使用 `--resume` 加载检查点，会自动恢复模型权重、优化器状态和迭代编号，并尝试加载同目录下的 `replay_buffer.pkl`：
+
+```bash
+python main.py train --resume models/latest_model.pt
+```
+
+**Q: 续训时 replay buffer 为空怎么办？**
+若 buffer 未保存或路径不对，训练仍可继续，但需重新积累样本（样本数达到 `batch_size × 10` 后才开始梯度更新）。可显式指定 buffer 文件：`--load-buffer models/replay_buffer.pkl`。
+
+**Q: 材料评估 warmup 是什么？**
+训练早期网络输出接近随机，MCTS 搜索质量差。`--material-warmup N` 在前 N 轮将棋子价值启发式混入 MCTS 叶节点评估，随轮次线性衰减至 0，帮助生成更高质量的早期自对弈数据。新模型建议设 50–100，已有一定棋力的续训可保持默认 0。
 
 **Q: 为什么 AI 走子看起来是随机的？**
 未训练的模型输出确实是随机的。需要先运行 `python main.py train` 进行训练。

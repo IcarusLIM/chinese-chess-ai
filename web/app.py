@@ -88,6 +88,27 @@ def init_ai(model_path: str = None, num_simulations: int = 200):
     print(f"[Web] AI 引擎初始化完成，MCTS 模拟次数: {num_simulations}")
 
 
+def _build_move_history(game: Game) -> list:
+    """通过回放棋局构建走子历史（含正确的棋子名称）。"""
+    if not game.move_history:
+        return []
+
+    history = []
+    temp = Game()
+    for from_pos, to_pos, captured, _, _ in game.move_history:
+        fr, fc = from_pos
+        tr, tc = to_pos
+        piece = temp.board[fr][fc]
+        history.append({
+            'from': {'row': fr, 'col': fc},
+            'to': {'row': tr, 'col': tc},
+            'piece': PIECE_NAMES.get(piece, '?'),
+            'captured': PIECE_NAMES.get(captured, ''),
+        })
+        temp.make_move(from_pos, to_pos, validate=False)
+    return history
+
+
 def game_state_to_dict(game: Game) -> dict:
     """
     将游戏状态转换为 JSON 可序列化的字典。
@@ -123,14 +144,7 @@ def game_state_to_dict(game: Game) -> dict:
         'is_game_over': is_over,
         'result': result,
         'fen': game.to_fen(),
-        'history': [
-            {
-                'from': {'row': fr, 'col': fc},
-                'to': {'row': tr, 'col': tc},
-                'piece': PIECE_NAMES.get(game.board[tr][tc] if len(game.move_history) > i else 0, '?'),
-            }
-            for i, ((fr, fc), (tr, tc), _) in enumerate(game.move_history)
-        ] if game.move_history else [],
+        'history': _build_move_history(game),
     }
 
 
@@ -190,7 +204,7 @@ def player_move():
         })
     
     # 执行走子
-    captured = current_game.make_move(from_pos, to_pos)
+    captured = current_game.make_move(from_pos, to_pos, validate=False)
     
     return jsonify({
         'success': True,
@@ -237,7 +251,7 @@ def ai_move():
     from_pos, to_pos = move
     
     # 执行走子
-    captured = current_game.make_move(from_pos, to_pos)
+    captured = current_game.make_move(from_pos, to_pos, validate=False)
     
     return jsonify({
         'success': True,
@@ -349,7 +363,9 @@ def download_game():
     
     # 重建每一步的棋盘状态
     temp_game = Game()
-    for i, ((fr, fc), (tr, tc), captured) in enumerate(current_game.move_history):
+    for i, (from_pos, to_pos, captured, _, _) in enumerate(current_game.move_history):
+        fr, fc = from_pos
+        tr, tc = to_pos
         piece = temp_game.board[fr][fc]
         game_record['moves'].append({
             'number': i + 1,
@@ -359,7 +375,7 @@ def download_game():
             'captured': PIECE_NAMES.get(captured, ''),
             'fen': temp_game.to_fen(),
         })
-        temp_game.make_move((fr, fc), (tr, tc))
+        temp_game.make_move((fr, fc), (tr, tc), validate=False)
     
     return jsonify({
         'success': True,
@@ -384,10 +400,10 @@ def replay_move():
 
     # 重建棋盘到指定步数
     temp_game = Game()
-    for i, ((fr, fc), (tr, tc), _) in enumerate(current_game.move_history):
+    for i, (from_pos, to_pos, _, _, _) in enumerate(current_game.move_history):
         if i >= move_index:
             break
-        temp_game.make_move((fr, fc), (tr, tc))
+        temp_game.make_move(from_pos, to_pos, validate=False)
     
     return jsonify({
         'success': True,

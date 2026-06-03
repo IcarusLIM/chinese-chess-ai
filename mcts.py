@@ -276,7 +276,7 @@ class MCTS:
             if move is None:
                 return
             fr, fc, tr, tc = move
-            current_game.make_move((fr, fc), (tr, tc))
+            current_game.make_move((fr, fc), (tr, tc), validate=False)
         
         # 检查游戏是否结束
         is_over, result = current_game.is_game_over()
@@ -436,11 +436,8 @@ class MCTSEvaluator:
         """
         # 执行搜索
         move_idx, policy = self.mcts.search(game, temperature=0.01)
-        
-        # 收集根节点的统计信息
-        root = self.mcts.mcts_root  # 需要在 search 中保存根节点引用
-        
-        # 简化实现：基于策略概率排序
+
+        # 基于 MCTS 策略概率排序
         legal_moves = game.get_legal_moves()
         move_scores = []
         

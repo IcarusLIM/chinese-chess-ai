@@ -47,8 +47,8 @@ class Game:
         # 当前走棋方：True=红方，False=黑方
         self.red_to_move = True
         
-        # 走子历史：[(from_pos, to_pos, captured_piece), ...]
-        self.move_history: List[Tuple[Tuple[int, int], Tuple[int, int], int]] = []
+        # 走子历史：[(from_pos, to_pos, captured_piece, halfmove_before, fullmove_before), ...]
+        self.move_history: List[Tuple[Tuple[int, int], Tuple[int, int], int, int, int]] = []
         
         # 局面哈希历史（用于三次重复和棋判定）
         self.hash_history: List[int] = []
@@ -535,13 +535,16 @@ class Game:
     # 走子操作
     # ============================================================
     
-    def make_move(self, from_pos: Tuple[int, int], to_pos: Tuple[int, int]) -> int:
+    def make_move(self, from_pos: Tuple[int, int], to_pos: Tuple[int, int],
+                  *, validate: bool = True) -> int:
         """
         执行一步走子。
         
         Args:
             from_pos: 起始位置 (row, col)
             to_pos: 目标位置 (row, col)
+            validate: 是否校验走法合法性。MCTS 等已过滤合法走法的
+                热路径应传 False，避免重复调用 get_legal_moves()。
             
         Returns:
             被吃掉的棋子编码（如果没有吃子返回 EMPTY）
@@ -561,13 +564,19 @@ class Game:
         target_piece = self.board[tr][tc]
         if target_piece != EMPTY and self.is_own_piece(target_piece):
             raise ValueError(f"目标位置 ({tr},{tc}) 有己方棋子")
+
+        if validate and (from_pos, to_pos) not in self.get_legal_moves():
+            raise ValueError(f"不合法的走法: ({fr},{fc}) → ({tr},{tc})")
         
         # 执行走子
         self.board[tr][tc] = moving_piece
         self.board[fr][fc] = EMPTY
         
-        # 保存历史
-        self.move_history.append((from_pos, to_pos, target_piece))
+        # 保存历史（含走子前的计数器，供悔棋恢复）
+        self.move_history.append((
+            from_pos, to_pos, target_piece,
+            self.halfmove_clock, self.fullmove_number,
+        ))
         
         # 更新Zobrist哈希
         self.current_hash ^= ZOBRIST_TABLE[moving_piece][fr][fc]  # 移除旧位置
@@ -603,7 +612,7 @@ class Game:
         if not self.move_history:
             return False
         
-        from_pos, to_pos, captured = self.move_history.pop()
+        from_pos, to_pos, captured, halfmove_before, fullmove_before = self.move_history.pop()
         fr, fc = from_pos
         tr, tc = to_pos
         
@@ -615,6 +624,10 @@ class Game:
         
         # 切换走棋方
         self.red_to_move = not self.red_to_move
+
+        # 恢复计数器
+        self.halfmove_clock = halfmove_before
+        self.fullmove_number = fullmove_before
         
         # 撤销哈希
         self.hash_history.pop()
