@@ -252,17 +252,12 @@ class Game:
     
     def _is_attacked_by_pawn(self, tr: int, tc: int, pawn_piece: int) -> bool:
         """检查目标位置是否被指定类型的兵攻击"""
-        # 兵的攻击方向取决于其所属阵营
         if pawn_piece == R_PAWN:
-            # 红兵：未过河只能前进，过河后可以左右
-            directions = [(-1, 0)]  # 红兵向上走
-            # 检查目标位置前方和两侧是否有红兵
             for dr, dc in [(-1, 0), (0, -1), (0, 1)]:
                 r, c = tr + dr, tc + dc
                 if self.in_board(r, c) and self.board[r][c] == R_PAWN:
                     return True
         else:
-            # 黑卒：向下走
             for dr, dc in [(1, 0), (0, -1), (0, 1)]:
                 r, c = tr + dr, tc + dc
                 if self.in_board(r, c) and self.board[r][c] == B_PAWN:

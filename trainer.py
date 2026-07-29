@@ -208,23 +208,24 @@ class Trainer:
     4. 记录训练日志
     """
     
-    def __init__(self, 
+    def __init__(self,
                  model: PolicyValueNet,
                  learning_rate: float = 0.001,
                  weight_decay: float = 1e-4,
-                 lr_milestones: List[int] = None,
-                 lr_gamma: float = 0.1):
+                 total_training_epochs: int = 500,
+                 lr_min: float = 1e-5):
         """
         Args:
             model: 策略-价值网络
             learning_rate: 初始学习率
             weight_decay: L2 正则化系数
-            lr_milestones: 学习率衰减的 epoch 节点
-            lr_gamma: 学习率衰减因子
+            total_training_epochs: 总训练 epoch 数（用于余弦退火）
+            lr_min: 最低学习率
         """
         self.model = model
         self.learning_rate = learning_rate
-        
+        self.total_training_epochs = total_training_epochs
+
         # 优化器：使用 SGD + 动量（比 Adam 更稳定）
         self.optimizer = torch.optim.SGD(
             model.parameters(),
@@ -232,17 +233,15 @@ class Trainer:
             momentum=0.9,
             weight_decay=weight_decay,
         )
-        
-        # 学习率调度器：在指定 epoch 衰减学习率
-        if lr_milestones is None:
-            lr_milestones = [50, 100, 150]
-        self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            self.optimizer, milestones=lr_milestones, gamma=lr_gamma
+
+        # 学习率调度器：余弦退火，平滑衰减无需追踪全局 epoch
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=total_training_epochs, eta_min=lr_min
         )
-        
+
         # 混合精度训练（RTX 5070 优化）
         self.scaler = torch.amp.GradScaler('cuda')
-        
+
         # 训练统计
         self.training_history = []
     
@@ -281,16 +280,24 @@ class Trainer:
             use_amp = device.type == 'cuda'
             with torch.amp.autocast('cuda', enabled=use_amp):
                 policy_logits, value_pred = self.model(states)
-                
-                # 策略损失：交叉熵
-                # 使用 log_softmax + NLLLoss 更数值稳定
+
+                # 策略损失：带非法走法掩码的交叉熵
+                # 将非法走法（目标概率为0）的 logit 设为 -inf，
+                # 使网络只专注于区分合法走法的好坏
+                illegal_mask = (target_policies.sum(dim=1, keepdim=True) == 0)
+                masked_logits = policy_logits.clone()
+                masked_logits[target_policies == 0] = float('-inf')
+                # 防止整行全为 -inf（极端情况，回退到原始 logits）
+                all_inf = (masked_logits == float('-inf')).all(dim=1, keepdim=True)
+                masked_logits = torch.where(all_inf, policy_logits, masked_logits)
+
                 policy_loss = -torch.mean(
-                    torch.sum(target_policies * F.log_softmax(policy_logits, dim=1), dim=1)
+                    torch.sum(target_policies * F.log_softmax(masked_logits, dim=1), dim=1)
                 )
-                
+
                 # 价值损失：均方误差
                 value_loss = F.mse_loss(value_pred.squeeze(-1), target_values)
-                
+
                 # 总损失
                 loss = policy_loss + value_loss
             
@@ -499,11 +506,12 @@ class TrainingPipeline:
                  batch_size: int = 256,
                  learning_rate: float = 0.001,
                  buffer_size: int = 100000,
-                 evaluate_every: int = 5,
+                 evaluate_every: int = 2,
                  save_dir: str = 'models',
                  resume_from: str = None,
                  load_buffer: str = None,
-                 material_warmup: int = 0):
+                 material_warmup: int = 0,
+                 num_iterations: int = 100):
         """
         Args:
             num_blocks: 残差块数量
@@ -519,6 +527,7 @@ class TrainingPipeline:
             resume_from: 从指定 checkpoint 继续训练
             load_buffer: 从指定文件加载 replay buffer
             material_warmup: 材料评估 warmup 迭代数（0=不启用）
+            num_iterations: 总训练迭代次数（用于余弦退火计算）
         """
         self.num_blocks = num_blocks
         self.channels = channels
@@ -542,7 +551,10 @@ class TrainingPipeline:
         self.device = device
 
         # 训练器（需要在 resume 之前创建，以便加载优化器状态）
-        self.trainer = Trainer(self.model, learning_rate=learning_rate)
+        # total_training_epochs 用于余弦退火调度器
+        total_epochs = num_iterations * training_epochs
+        self.trainer = Trainer(self.model, learning_rate=learning_rate,
+                               total_training_epochs=total_epochs)
 
         # 断点续训：加载 checkpoint
         if resume_from and os.path.exists(resume_from):
@@ -576,6 +588,19 @@ class TrainingPipeline:
 
         # 评估器
         self.evaluator = ModelEvaluator(num_games=20, num_simulations=num_simulations)
+
+    def _trim_replay_buffer(self, keep_recent: int = 50000):
+        """
+        裁剪 replay buffer，只保留最近的 keep_recent 条数据。
+
+        这是 AlphaZero 训练的关键：旧模型生成的数据质量低，
+        长期保留会导致模型在过时数据上反复训练，阻碍收敛。
+        """
+        if len(self.replay_buffer) > keep_recent:
+            # deque 支持从左侧高效弹出
+            while len(self.replay_buffer) > keep_recent:
+                self.replay_buffer.popleft()
+            print(f"[训练] replay buffer 已裁剪至 {len(self.replay_buffer)} 条")
 
     def _save_replay_buffer(self):
         """将 replay buffer 保存到磁盘。"""
@@ -659,6 +684,8 @@ class TrainingPipeline:
             
             # 添加到经验回放缓冲区
             self.replay_buffer.extend(game_data)
+            # 裁剪旧数据，防止过时数据稀释新学习
+            self._trim_replay_buffer(keep_recent=self.buffer_size * 2 // 3)
             print(f"  新增样本: {len(game_data)}，缓冲区大小: {len(self.replay_buffer)}")
             
             # 步骤2：训练神经网络
@@ -738,10 +765,11 @@ def train_from_scratch():
         batch_size=256,        # 批大小（RTX 5070 12GB 足够）
         learning_rate=0.001,   # 初始学习率
         buffer_size=100000,    # 经验回放缓冲区大小
-        evaluate_every=5,      # 每5轮评估一次
+        evaluate_every=2,      # 每2轮评估一次
         save_dir='models',     # 模型保存目录
+        num_iterations=100,    # 总迭代次数
     )
-    
+
     pipeline.run(num_iterations=100)
 
 

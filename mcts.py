@@ -258,56 +258,55 @@ class MCTS:
     def _simulate(self, game: Game, node: MCTSNode):
         """
         执行一次模拟：从根节点走到叶节点，然后评估。
-        
+
         Args:
             game: 当前游戏状态（会在此基础上模拟走子）
             node: 当前节点
         """
         # 选择阶段：沿树向下选择直到叶节点
         search_path = [(node, -1)]
-        current_game = game.copy()
 
         while node.is_expanded and node.children:
             move_idx, node = node.select_child(self.c_puct, sum(node.N.values()) if node.N else 0)
             search_path.append((node, move_idx))
 
-            # 在模拟棋盘上执行走子
+            # 在原棋盘上执行走子（避免 game.copy() 开销）
             move = self.move_index.index_to_move(move_idx)
             if move is None:
                 return
             fr, fc, tr, tc = move
-            current_game.make_move((fr, fc), (tr, tc), validate=False)
-        
+            game.make_move((fr, fc), (tr, tc), validate=False)
+
         # 检查游戏是否结束
-        is_over, result = current_game.is_game_over()
-        
+        is_over, result = game.is_game_over()
+
         if is_over:
             # 游戏结束，从当前走棋方视角返回
             if result == 'red_wins':
-                value = 1.0 if current_game.red_to_move else -1.0
+                value = 1.0 if game.red_to_move else -1.0
             elif result == 'black_wins':
-                value = -1.0 if current_game.red_to_move else 1.0
+                value = -1.0 if game.red_to_move else 1.0
             else:
                 value = 0.0
         else:
             # 未结束，用神经网络评估（可选混合材料评估）
-            board_tensor = current_game.get_board_tensor()
+            board_tensor = game.get_board_tensor()
             policy_probs, network_value = self.model.predict(board_tensor)
 
             if self.material_weight > 0:
-                material_value = current_game.evaluate_material_normalized()
+                material_value = game.evaluate_material_normalized()
                 value = (1 - self.material_weight) * network_value + self.material_weight * material_value
             else:
                 value = network_value
-            
+
             # 扩展叶节点
-            legal_moves = current_game.get_legal_moves()
+            legal_moves = game.get_legal_moves()
             legal_indices = []
             for (fr, fc), (tr, tc) in legal_moves:
                 idx = self.move_index.move_to_index((fr, fc, tr, tc))
                 if idx is not None:
                     legal_indices.append(idx)
-            
+
             if legal_indices:
                 legal_priors = [policy_probs[idx] for idx in legal_indices]
                 prior_sum = sum(legal_priors)
@@ -316,7 +315,7 @@ class MCTS:
                 else:
                     legal_priors = [1.0 / len(legal_indices)] * len(legal_indices)
                 node.expand(legal_indices, legal_priors)
-        
+
         # 回溯阶段：沿路径回传价值
         # value 为叶节点走棋方视角，走子交替，到叶节点的
         # 距离为偶数 → 同色 → 用 value，奇数 → 异色 → 用 -value
@@ -328,6 +327,10 @@ class MCTS:
                 parent_node.backup(move_idx, value)
             else:
                 parent_node.backup(move_idx, -value)
+
+        # 撤销所有走子，恢复原始棋盘状态
+        for _ in range(depth):
+            game.undo_move()
     
     def _compute_policy(self, root: MCTSNode, temperature: float) -> List[float]:
         """

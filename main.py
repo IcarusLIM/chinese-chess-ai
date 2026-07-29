@@ -44,6 +44,8 @@ def cmd_train(args):
         resume_from=args.resume,
         load_buffer=args.load_buffer,
         material_warmup=args.material_warmup,
+        num_iterations=args.iterations,
+        evaluate_every=args.evaluate_every,
     )
 
     pipeline.run(num_iterations=args.iterations)
@@ -156,6 +158,7 @@ def main():
     # === train 子命令 ===
     train_parser = subparsers.add_parser('train', help='自对弈训练')
     train_parser.add_argument('--iterations', type=int, default=100, help='训练迭代次数')
+    train_parser.add_argument('--evaluate-every', type=int, default=2, help='每隔多少轮评估一次')
     train_parser.add_argument('--blocks', type=int, default=10, help='残差块数量')
     train_parser.add_argument('--channels', type=int, default=256, help='特征通道数')
     train_parser.add_argument('--simulations', type=int, default=400, help='MCTS 模拟次数')
