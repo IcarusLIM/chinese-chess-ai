@@ -11,15 +11,16 @@
   2. 训练神经网络
      - 使用自对弈数据训练
      - 损失 = 策略损失 + 价值损失 + L2正则化
-  3. 评估新模型
-     - 新模型 vs 旧模型对弈
-     - 胜率 > 55% 则接受新模型
+  3. 评估候选模型
+     - 候选模型 vs 当前基准模型对弈
+     - 固定多开局、交换红黑进行成对评估
+     - 计分率（胜=1、和=0.5、负=0）> 55% 则接受新模型
   4. 重复
 
 关键超参数：
   - 每次自对弈生成多少局
   - 每局最多走多少步
-  - 训练的 epoch 数
+  - 每轮固定训练 batch 数
   - 学习率和调度策略
 
 硬件优化：
@@ -29,6 +30,7 @@
 """
 
 import os
+import json
 import time
 import random
 import copy
@@ -37,13 +39,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from typing import List, Tuple, Dict, Optional
+from torch.utils.data import Dataset, DataLoader, RandomSampler
+from typing import List, Tuple, Dict
 from collections import deque
 
 from game import Game
-from network import PolicyValueNet, create_model
-from mcts import MCTS, MCTSEvaluator
+from network import PolicyValueNet, create_model, read_checkpoint
+from mcts import InferenceCache, MCTS, MCTSEvaluator
 from move_index import get_move_index
 from constants import BOARD_ROWS, BOARD_COLS
 
@@ -52,29 +54,54 @@ class GameDataset(Dataset):
     """
     棋局数据集
     
-    存储自对弈产生的训练样本，每个样本包含：
-    - board_tensor: 棋盘状态 [15, 10, 9]
-    - policy: MCTS 策略分布 [num_moves]
-    - value: 游戏结果（+1 红胜, -1 黑胜, 0 和棋）
+    样本使用紧凑格式：uint8 棋盘、稀疏 float16 策略、bit-pack 合法掩码、int8 结果。
+    读取时展开为训练需要的 dense float32 Tensor。
     """
     
     def __init__(self, data: List[Tuple]):
         """
         Args:
-            data: 样本列表，每个元素为 (board_tensor, policy, value)
+            data: 紧凑五元组样本列表
         """
         self.data = data
+        self.num_moves = get_move_index().num_moves
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        board_tensor, policy, value = self.data[idx]
+        board_tensor, policy_indices, policy_values, packed_legal_mask, value = self.data[idx]
+        policy = np.zeros(self.num_moves, dtype=np.float32)
+        policy[np.asarray(policy_indices, dtype=np.int64)] = np.asarray(
+            policy_values, dtype=np.float32
+        )
+        policy_sum = float(policy.sum())
+        if policy_sum > 0:
+            policy /= policy_sum
+        legal_mask = np.unpackbits(
+            np.asarray(packed_legal_mask, dtype=np.uint8),
+            count=self.num_moves,
+            bitorder='little',
+        ).astype(np.bool_)
         return (
             torch.tensor(board_tensor, dtype=torch.float32),
             torch.tensor(policy, dtype=torch.float32),
+            torch.tensor(legal_mask, dtype=torch.bool),
             torch.tensor(value, dtype=torch.float32),
         )
+
+
+def compact_training_sample(board_tensor, policy, legal_mask, value) -> Tuple:
+    """将自对弈样本压缩为适合长期 replay buffer 保存的格式。"""
+    board = np.asarray(board_tensor, dtype=np.uint8)
+    policy_array = np.asarray(policy, dtype=np.float32)
+    policy_indices = np.flatnonzero(policy_array > 0).astype(np.uint16)
+    policy_values = policy_array[policy_indices].astype(np.float16)
+    packed_legal_mask = np.packbits(
+        np.asarray(legal_mask, dtype=np.bool_), bitorder='little'
+    )
+    compact_value = np.int8(round(float(value)))
+    return board, policy_indices, policy_values, packed_legal_mask, compact_value
 
 
 class SelfPlayWorker:
@@ -88,6 +115,8 @@ class SelfPlayWorker:
     def __init__(self,
                  model: PolicyValueNet,
                  num_simulations: int = 400,
+                 inference_batch_size: int = 64,
+                 inference_cache_size: int = 10000,
                  max_moves: int = 200,
                  temperature_threshold: int = 30,
                  material_weight: float = 0.0):
@@ -95,32 +124,42 @@ class SelfPlayWorker:
         Args:
             model: 当前模型
             num_simulations: MCTS 模拟次数
+            inference_batch_size: MCTS GPU 叶节点推理批大小
+            inference_cache_size: 当前模型权重的 LRU 局面缓存容量
             max_moves: 每局最大走子数（超过判和）
             temperature_threshold: 走子数超过此值后温度降为 0.01
             material_weight: MCTS 叶节点材料评估混合权重
         """
         self.model = model
         self.num_simulations = num_simulations
+        self.inference_batch_size = inference_batch_size
+        self.inference_cache = InferenceCache(inference_cache_size)
         self.max_moves = max_moves
         self.temperature_threshold = temperature_threshold
         self.material_weight = material_weight
         self.move_index = get_move_index()
+        self.last_inference_calls = 0
+        self.last_inference_positions = 0
     
     def play_one_game(self) -> List[Tuple]:
         """
         执行一局自对弈，收集训练数据。
         
         Returns:
-            训练样本列表，每个元素为 (board_tensor, policy, value)
-            其中 value 是最终游戏结果（从红方视角）
+            训练样本列表，每个元素为 (board_tensor, policy, legal_mask, value)
+            其中 value 是最终游戏结果（从当前走棋方视角）
         """
         game = Game()
         mcts = MCTS(self.model, num_simulations=self.num_simulations,
+                    add_root_noise=True,
+                    inference_batch_size=self.inference_batch_size,
+                    inference_cache=self.inference_cache,
                     material_weight=self.material_weight)
         
         # 存储每一步的数据
         states = []    # 棋盘状态
         policies = []  # MCTS 策略
+        legal_masks = []  # 真实合法走法掩码
         
         move_count = 0
         
@@ -140,8 +179,11 @@ class SelfPlayWorker:
                 break  # 没有合法走法（游戏结束）
             
             # 记录训练数据
+            legal_mask = np.zeros(self.move_index.num_moves, dtype=np.bool_)
+            legal_mask[mcts.last_legal_indices] = True
             states.append(game.get_board_tensor())
             policies.append(policy)
+            legal_masks.append(legal_mask)
             
             # 执行走子
             move = self.move_index.index_to_move(move_idx)
@@ -150,11 +192,6 @@ class SelfPlayWorker:
             fr, fc, tr, tc = move
             game.make_move((fr, fc), (tr, tc), validate=False)
             move_count += 1
-            
-            # 检查游戏是否结束
-            is_over, result = game.is_game_over()
-            if is_over:
-                break
         
         # 确定游戏结果
         is_over, result = game.is_game_over()
@@ -168,14 +205,18 @@ class SelfPlayWorker:
         # 构建训练样本
         # 价值从当前走棋方的视角：红方走棋时为 final_value，黑方走棋时翻转
         training_data = []
-        for i, (state, policy) in enumerate(zip(states, policies)):
+        for i, (state, policy, legal_mask) in enumerate(zip(states, policies, legal_masks)):
             # 第 i 步时的走棋方（红方先走，交替进行）
             if i % 2 == 0:
                 value = final_value  # 红方走棋
             else:
                 value = -final_value  # 黑方走棋
-            training_data.append((state, policy, value))
-        
+            training_data.append(
+                compact_training_sample(state, policy, legal_mask, value)
+            )
+
+        self.last_inference_calls = mcts.inference_calls
+        self.last_inference_positions = mcts.inference_positions
         return training_data
     
     def play_multiple_games(self, num_games: int) -> List[Tuple]:
@@ -189,11 +230,28 @@ class SelfPlayWorker:
             所有训练样本的列表
         """
         all_data = []
+        # 模型每轮训练后会更新，因此每轮自对弈前清空上一组权重的缓存。
+        self.inference_cache.clear()
+        total_inference_calls = 0
+        total_inference_positions = 0
         for i in range(num_games):
             game_data = self.play_one_game()
             all_data.extend(game_data)
+            total_inference_calls += self.last_inference_calls
+            total_inference_positions += self.last_inference_positions
             if (i + 1) % 3 == 0:
                 print(f"  自对弈进度: {i+1}/{num_games}，累计样本数: {len(all_data)}")
+        average_batch = (
+            total_inference_positions / total_inference_calls if total_inference_calls else 0.0
+        )
+        print(
+            f"  MCTS 网络推理: {total_inference_calls} 批 / "
+            f"{total_inference_positions} 个局面，平均批大小: {average_batch:.1f}"
+        )
+        print(
+            f"  推理缓存: {self.inference_cache.hits} 命中 / "
+            f"{self.inference_cache.misses} 未命中，当前 {len(self.inference_cache)} 项"
+        )
         return all_data
 
 
@@ -212,19 +270,20 @@ class Trainer:
                  model: PolicyValueNet,
                  learning_rate: float = 0.001,
                  weight_decay: float = 1e-4,
-                 total_training_epochs: int = 500,
+                 total_training_iterations: int = 100,
                  lr_min: float = 1e-5):
         """
         Args:
             model: 策略-价值网络
             learning_rate: 初始学习率
             weight_decay: L2 正则化系数
-            total_training_epochs: 总训练 epoch 数（用于余弦退火）
+            total_training_iterations: 总训练迭代数（用于余弦退火）
             lr_min: 最低学习率
         """
         self.model = model
         self.learning_rate = learning_rate
-        self.total_training_epochs = total_training_epochs
+        self.total_training_iterations = total_training_iterations
+        self.use_amp = next(model.parameters()).device.type == 'cuda'
 
         # 优化器：使用 SGD + 动量（比 Adam 更稳定）
         self.optimizer = torch.optim.SGD(
@@ -236,22 +295,22 @@ class Trainer:
 
         # 学习率调度器：余弦退火，平滑衰减无需追踪全局 epoch
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=total_training_epochs, eta_min=lr_min
+            self.optimizer, T_max=total_training_iterations, eta_min=lr_min
         )
 
         # 混合精度训练（RTX 5070 优化）
-        self.scaler = torch.amp.GradScaler('cuda')
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
         # 训练统计
         self.training_history = []
     
-    def train_epoch(self, dataloader: DataLoader, epoch: int) -> Dict[str, float]:
+    def train_iteration(self, dataloader: DataLoader, iteration: int) -> Dict[str, float]:
         """
-        训练一个 epoch。
+        完成一轮固定 batch 数的网络训练。
         
         Args:
             dataloader: 训练数据加载器
-            epoch: 当前 epoch 编号
+            iteration: 当前训练迭代编号
             
         Returns:
             训练指标字典
@@ -262,34 +321,33 @@ class Trainer:
         total_policy_loss = 0.0
         total_value_loss = 0.0
         num_batches = 0
-        
-        for batch_idx, (states, target_policies, target_values) in enumerate(dataloader):
-            device = next(self.model.parameters()).device
+
+        device = next(self.model.parameters()).device
+        for states, target_policies, legal_masks, target_values in dataloader:
             # 移动到计算设备
             states = states.to(device, non_blocking=True)
             target_policies = target_policies.to(device, non_blocking=True)
+            legal_masks = legal_masks.to(device, non_blocking=True)
             target_values = target_values.to(device, non_blocking=True)
             
             # channels_last 内存格式
             states = states.to(memory_format=torch.channels_last)
             
             # 清除梯度
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             
             # 混合精度前向传播（仅 CUDA 启用）
-            use_amp = device.type == 'cuda'
-            with torch.amp.autocast('cuda', enabled=use_amp):
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
                 policy_logits, value_pred = self.model(states)
 
-                # 策略损失：带非法走法掩码的交叉熵
-                # 将非法走法（目标概率为0）的 logit 设为 -inf，
-                # 使网络只专注于区分合法走法的好坏
-                illegal_mask = (target_policies.sum(dim=1, keepdim=True) == 0)
-                masked_logits = policy_logits.clone()
-                masked_logits[target_policies == 0] = float('-inf')
-                # 防止整行全为 -inf（极端情况，回退到原始 logits）
-                all_inf = (masked_logits == float('-inf')).all(dim=1, keepdim=True)
-                masked_logits = torch.where(all_inf, policy_logits, masked_logits)
+                # 只屏蔽真正非法的走法；合法但 MCTS 未访问的走法仍参与归一化。
+                valid_rows = legal_masks.any(dim=1, keepdim=True)
+                effective_masks = torch.where(
+                    valid_rows, legal_masks, torch.ones_like(legal_masks)
+                )
+                masked_logits = policy_logits.masked_fill(
+                    ~effective_masks, torch.finfo(policy_logits.dtype).min
+                )
 
                 policy_loss = -torch.mean(
                     torch.sum(target_policies * F.log_softmax(masked_logits, dim=1), dim=1)
@@ -300,17 +358,27 @@ class Trainer:
 
                 # 总损失
                 loss = policy_loss + value_loss
+
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"训练损失出现 NaN/Inf: policy={policy_loss.item()}, "
+                    f"value={value_loss.item()}"
+                )
             
             # 混合精度反向传播
-            if use_amp:
+            if self.use_amp:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 1.0, error_if_nonfinite=True
+                )
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 1.0, error_if_nonfinite=True
+                )
                 self.optimizer.step()
             
             # 累计损失
@@ -328,6 +396,7 @@ class Trainer:
         avg_value_loss = total_value_loss / max(num_batches, 1)
         
         metrics = {
+            'iteration': iteration,
             'loss': avg_loss,
             'policy_loss': avg_policy_loss,
             'value_loss': avg_value_loss,
@@ -338,29 +407,34 @@ class Trainer:
         
         return metrics
     
-    def save_checkpoint(self, path: str, epoch: int, additional_info: Dict = None):
+    def save_checkpoint(self, path: str, iteration: int):
         """
         保存模型检查点。
         
         Args:
             path: 保存路径
-            epoch: 当前 epoch
-            additional_info: 额外保存的信息
+            iteration: 当前训练迭代编号
         """
+        self._ensure_model_finite("保存检查点")
         checkpoint = {
-            'epoch': epoch,
+            'iteration': iteration,
+            'model_config': {
+                'num_blocks': self.model.num_blocks,
+                'channels': self.model.channels,
+            },
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict(),
             'training_history': self.training_history,
         }
-        if additional_info:
-            checkpoint.update(additional_info)
         
-        torch.save(checkpoint, path)
+        temp_path = f"{path}.tmp"
+        torch.save(checkpoint, temp_path)
+        os.replace(temp_path, path)
         print(f"[训练] 检查点已保存: {path}")
     
-    def load_checkpoint(self, path: str) -> dict:
+    def load_checkpoint(self, path: str) -> int:
         """
         加载模型检查点。
 
@@ -368,104 +442,170 @@ class Trainer:
             path: 检查点文件路径
 
         Returns:
-            checkpoint 中的 additional_info 字典（包含 iteration 等）
+            检查点对应的训练迭代编号
         """
         device = next(self.model.parameters()).device
-        checkpoint = torch.load(path, map_location=device)
+        checkpoint = read_checkpoint(path, str(device))
+        return self.restore_checkpoint(checkpoint, path)
+
+    def restore_checkpoint(self, checkpoint: Dict, source: str) -> int:
+        """从已读取的检查点恢复模型、优化器和训练状态。"""
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
+        self._ensure_model_finite("加载检查点")
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        # 允许续训时延长总迭代数，同时保留已完成的调度进度。
+        self.scheduler.T_max = self.total_training_iterations
+        self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         self.training_history = checkpoint.get('training_history', [])
 
-        epoch = checkpoint['epoch']
-        print(f"[训练] 检查点已加载: {path} (epoch {epoch})")
+        iteration = checkpoint['iteration']
+        print(f"[训练] 检查点已加载: {source} (iteration {iteration})")
+        return iteration
 
-        # 返回额外信息（包含 iteration 等）
-        additional = {}
-        for key, value in checkpoint.items():
-            if key not in ('model_state_dict', 'optimizer_state_dict',
-                           'scheduler_state_dict', 'training_history', 'epoch'):
-                additional[key] = value
-        return additional
+    def _ensure_model_finite(self, operation: str):
+        """阻止包含 NaN/Inf 的模型继续训练或写入检查点。"""
+        for name, parameter in self.model.named_parameters():
+            if not torch.isfinite(parameter).all():
+                raise FloatingPointError(f"{operation}失败：参数 {name} 包含 NaN/Inf")
 
 
 class ModelEvaluator:
     """
     模型评估器
     
-    通过让新旧模型对弈来评估模型强度。
-    胜率超过阈值则接受新模型。
+    使用固定的多开局套件，并在每个开局交换红黑进行成对评估。
+    计分率超过阈值则接受候选模型。
     """
     
-    def __init__(self, num_games: int = 20, num_simulations: int = 200):
+    def __init__(self, num_games: int = 20, num_simulations: int = 200,
+                 inference_batch_size: int = 64,
+                 inference_cache_size: int = 10000,
+                 acceptance_threshold: float = 0.55, opening_seed: int = 20240814):
         """
         Args:
             num_games: 评估对弈局数
             num_simulations: MCTS 模拟次数
+            inference_batch_size: MCTS GPU 叶节点推理批大小
+            inference_cache_size: 每个参评模型的 LRU 局面缓存容量
+            acceptance_threshold: 候选模型最低计分率
+            opening_seed: 固定开局套件的随机种子
         """
+        if num_games < 2 or num_games % 2 != 0:
+            raise ValueError("num_games 必须是大于等于 2 的偶数，以便交换红黑成对评估")
         self.num_games = num_games
         self.num_simulations = num_simulations
+        self.inference_batch_size = inference_batch_size
+        self.inference_cache_size = inference_cache_size
+        self.acceptance_threshold = acceptance_threshold
+        self.opening_seed = opening_seed
         self.move_index = get_move_index()
     
-    def evaluate(self, new_model: PolicyValueNet, old_model: PolicyValueNet) -> Dict:
+    def evaluate(self, candidate_model: PolicyValueNet,
+                 reference_model: PolicyValueNet) -> Dict:
         """
-        评估新模型相对于旧模型的胜率。
+        评估候选模型相对于当前基准模型的表现。
         
         Args:
-            new_model: 新训练的模型
-            old_model: 旧模型（基线）
+            candidate_model: 刚完成一轮训练的候选模型
+            reference_model: 最近一次通过评估的基准模型
             
         Returns:
             评估结果字典
         """
-        new_wins = 0
-        old_wins = 0
+        candidate_wins = 0
+        reference_wins = 0
         draws = 0
+        candidate_cache = InferenceCache(self.inference_cache_size)
+        reference_cache = InferenceCache(self.inference_cache_size)
         
         for game_idx in range(self.num_games):
-            # 交替先后手
+            # 每两局使用同一开局并交换红黑，消除先手和单一开局偏差。
+            opening_game = self._create_opening(game_idx // 2)
             if game_idx % 2 == 0:
-                red_model, black_model = new_model, old_model
-                new_is_red = True
+                red_model, black_model = candidate_model, reference_model
+                red_cache, black_cache = candidate_cache, reference_cache
+                candidate_is_red = True
             else:
-                red_model, black_model = old_model, new_model
-                new_is_red = False
+                red_model, black_model = reference_model, candidate_model
+                red_cache, black_cache = reference_cache, candidate_cache
+                candidate_is_red = False
             
-            result = self._play_evaluation_game(red_model, black_model)
+            result = self._play_evaluation_game(
+                red_model, black_model, opening_game, red_cache, black_cache
+            )
             
             if result == 'red_wins':
-                if new_is_red:
-                    new_wins += 1
+                if candidate_is_red:
+                    candidate_wins += 1
                 else:
-                    old_wins += 1
+                    reference_wins += 1
             elif result == 'black_wins':
-                if new_is_red:
-                    old_wins += 1
+                if candidate_is_red:
+                    reference_wins += 1
                 else:
-                    new_wins += 1
+                    candidate_wins += 1
             else:
                 draws += 1
             
             if (game_idx + 1) % 5 == 0:
                 print(f"  评估进度: {game_idx+1}/{self.num_games}")
         
-        total = new_wins + old_wins + draws
-        win_rate = new_wins / total if total > 0 else 0
+        total = candidate_wins + reference_wins + draws
+        win_rate = candidate_wins / total if total > 0 else 0
+        score_rate = (candidate_wins + 0.5 * draws) / total if total > 0 else 0
         
         return {
-            'new_wins': new_wins,
-            'old_wins': old_wins,
+            'candidate_wins': candidate_wins,
+            'reference_wins': reference_wins,
             'draws': draws,
             'win_rate': win_rate,
-            'accepted': win_rate > 0.55,
+            'score_rate': score_rate,
+            'accepted': score_rate > self.acceptance_threshold,
         }
-    
-    def _play_evaluation_game(self, red_model: PolicyValueNet, black_model: PolicyValueNet) -> str:
-        """执行一局评估对弈"""
+
+    def _create_opening(self, opening_index: int) -> Game:
+        """生成固定、可复现的非终局开局；每个开局保持红方走棋。"""
         game = Game()
-        red_mcts = MCTS(red_model, num_simulations=self.num_simulations)
-        black_mcts = MCTS(black_model, num_simulations=self.num_simulations)
+        rng = random.Random(self.opening_seed + opening_index)
+        opening_plies = 4 + 2 * (opening_index % 4)
+        for _ in range(opening_plies):
+            legal_moves = game.get_legal_moves()
+            if not legal_moves:
+                break
+            rng.shuffle(legal_moves)
+            moved = False
+            for move in legal_moves:
+                game.make_move(*move, validate=False)
+                is_over, _ = game.is_game_over()
+                if not is_over:
+                    moved = True
+                    break
+                game.undo_move()
+            if not moved:
+                break
+        if not game.red_to_move:
+            game.undo_move()
+        return game
+
+    def _play_evaluation_game(self, red_model: PolicyValueNet,
+                              black_model: PolicyValueNet,
+                              opening_game: Game = None,
+                              red_cache: InferenceCache = None,
+                              black_cache: InferenceCache = None) -> str:
+        """执行一局评估对弈"""
+        game = opening_game.copy() if opening_game is not None else Game()
+        red_mcts = MCTS(
+            red_model, num_simulations=self.num_simulations,
+            inference_batch_size=self.inference_batch_size,
+            inference_cache=red_cache,
+        )
+        black_mcts = MCTS(
+            black_model, num_simulations=self.num_simulations,
+            inference_batch_size=self.inference_batch_size,
+            inference_cache=black_cache,
+        )
         
         for _ in range(200):
             if game.red_to_move:
@@ -501,81 +641,126 @@ class TrainingPipeline:
                  num_blocks: int = 10,
                  channels: int = 256,
                  num_simulations: int = 400,
+                 inference_batch_size: int = 64,
+                 inference_cache_size: int = 10000,
+                 eval_simulations: int = 200,
                  self_play_games: int = 25,
-                 training_epochs: int = 5,
+                 training_steps: int = 500,
                  batch_size: int = 256,
+                 data_workers: int = 4,
                  learning_rate: float = 0.001,
                  buffer_size: int = 100000,
                  evaluate_every: int = 2,
                  save_dir: str = 'models',
                  resume_from: str = None,
                  load_buffer: str = None,
-                 material_warmup: int = 0,
+                 material_warmup: int = 80,
                  num_iterations: int = 100):
         """
         Args:
             num_blocks: 残差块数量
             channels: 特征通道数
             num_simulations: MCTS 模拟次数
+            inference_batch_size: MCTS GPU 叶节点推理批大小
+            inference_cache_size: 当前模型权重的 LRU 推理缓存容量
+            eval_simulations: 模型评估时每步 MCTS 模拟次数
             self_play_games: 每轮自对弈局数
-            training_epochs: 每轮训练的 epoch 数
+            training_steps: 每轮从 replay buffer 随机采样的 batch 数
             batch_size: 训练批大小
+            data_workers: 训练 DataLoader 工作进程数
             learning_rate: 初始学习率
             buffer_size: 经验回放缓冲区大小
             evaluate_every: 每隔多少轮评估一次
             save_dir: 模型保存目录
             resume_from: 从指定 checkpoint 继续训练
-            load_buffer: 从指定文件加载 replay buffer
+            load_buffer: 从 replay 目录或 manifest 加载数据
             material_warmup: 材料评估 warmup 迭代数（0=不启用）
             num_iterations: 总训练迭代次数（用于余弦退火计算）
         """
         self.num_blocks = num_blocks
         self.channels = channels
         self.num_simulations = num_simulations
+        self.inference_batch_size = inference_batch_size
+        self.inference_cache_size = max(0, inference_cache_size)
+        self.eval_simulations = eval_simulations
         self.self_play_games = self_play_games
-        self.training_epochs = training_epochs
+        self.training_steps = max(1, training_steps)
         self.batch_size = batch_size
+        self.data_workers = max(0, data_workers)
         self.learning_rate = learning_rate
         self.buffer_size = buffer_size
+        self.replay_window_size = max(1, buffer_size * 2 // 3)
         self.evaluate_every = evaluate_every
         self.save_dir = save_dir
         self.material_warmup = material_warmup
         self.start_iteration = 1
 
+        # 不允许“从零训练”静默覆盖或混入已有训练产物。
+        if not resume_from and os.path.isdir(save_dir):
+            existing_artifacts = []
+            for name in os.listdir(save_dir):
+                if name == 'latest_model.pt' or (
+                    name.startswith('checkpoint_iter_') and name.endswith('.pt')
+                ):
+                    existing_artifacts.append(os.path.join(save_dir, name))
+            existing_manifest = os.path.join(save_dir, 'replay', 'manifest.json')
+            if os.path.exists(existing_manifest):
+                existing_artifacts.append(existing_manifest)
+            if existing_artifacts:
+                raise FileExistsError(
+                    f"保存目录 {save_dir} 已包含训练产物；从零训练请指定新的 "
+                    "--save-dir，继续训练请显式使用 --resume"
+                )
+
         # 创建保存目录
         os.makedirs(save_dir, exist_ok=True)
 
-        # 初始化模型
+        # 初始化模型；续训时检查点中的网络结构是唯一数据源。
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.model = create_model(num_blocks, channels, device=device)
+        resume_checkpoint = None
+        if resume_from:
+            if not os.path.exists(resume_from):
+                raise FileNotFoundError(f"checkpoint 不存在: {resume_from}")
+            resume_checkpoint = read_checkpoint(resume_from, device)
+            model_config = resume_checkpoint['model_config']
+            self.num_blocks = model_config['num_blocks']
+            self.channels = model_config['channels']
+        self.model = create_model(self.num_blocks, self.channels, device=device)
         self.device = device
 
         # 训练器（需要在 resume 之前创建，以便加载优化器状态）
-        # total_training_epochs 用于余弦退火调度器
-        total_epochs = num_iterations * training_epochs
-        self.trainer = Trainer(self.model, learning_rate=learning_rate,
-                               total_training_epochs=total_epochs)
+        # 学习率每个训练迭代更新一次，而非随不断增长的 buffer 长度变化。
+        total_training_iterations = num_iterations
+        self.trainer = Trainer(
+            self.model, learning_rate=learning_rate,
+            total_training_iterations=total_training_iterations,
+        )
 
         # 断点续训：加载 checkpoint
-        if resume_from and os.path.exists(resume_from):
-            additional = self.trainer.load_checkpoint(resume_from)
-            if isinstance(additional, dict):
-                self.start_iteration = additional.get('iteration', 1) + 1
+        if resume_checkpoint is not None:
+            completed_iteration = self.trainer.restore_checkpoint(
+                resume_checkpoint, resume_from
+            )
+            self.start_iteration = completed_iteration + 1
             print(f"[训练] 从迭代 {self.start_iteration} 继续训练")
 
         # 经验回放缓冲区
-        self.replay_buffer = deque(maxlen=buffer_size)
+        self.replay_buffer = deque(maxlen=self.replay_window_size)
+        self.replay_dir = os.path.join(save_dir, 'replay')
+        self.replay_manifest_path = os.path.join(self.replay_dir, 'manifest.json')
 
         # 加载 replay buffer
         buffer_loaded = False
-        if load_buffer and os.path.exists(load_buffer):
-            self._load_replay_buffer(load_buffer)
+        if load_buffer:
+            if not os.path.exists(load_buffer):
+                raise FileNotFoundError(f"replay 路径不存在: {load_buffer}")
+            self._load_replay_source(load_buffer)
             buffer_loaded = True
         elif resume_from:
-            # 自动查找同目录下的 replay_buffer.pkl
-            auto_buffer = os.path.join(os.path.dirname(resume_from), 'replay_buffer.pkl')
-            if os.path.exists(auto_buffer):
-                self._load_replay_buffer(auto_buffer)
+            checkpoint_dir = os.path.dirname(resume_from)
+            auto_manifest = os.path.join(checkpoint_dir, 'replay', 'manifest.json')
+            if os.path.exists(auto_manifest):
+                self._load_replay_shards(auto_manifest)
                 buffer_loaded = True
 
         if not buffer_loaded:
@@ -583,44 +768,80 @@ class TrainingPipeline:
 
         # 自对弈工作器（material_weight 在 run() 中动态设置）
         self.self_play_worker = SelfPlayWorker(
-            self.model, num_simulations=num_simulations
+            self.model, num_simulations=num_simulations,
+            inference_batch_size=inference_batch_size,
+            inference_cache_size=self.inference_cache_size,
         )
 
         # 评估器
-        self.evaluator = ModelEvaluator(num_games=20, num_simulations=num_simulations)
+        self.evaluator = ModelEvaluator(
+            num_games=20, num_simulations=eval_simulations,
+            inference_batch_size=inference_batch_size,
+            inference_cache_size=self.inference_cache_size,
+        )
 
-    def _trim_replay_buffer(self, keep_recent: int = 50000):
-        """
-        裁剪 replay buffer，只保留最近的 keep_recent 条数据。
+    def _save_replay_shard(self, new_data: List[Tuple], iteration: int):
+        """只保存本轮新增样本，并通过 manifest 管理最近的分片。"""
+        if not new_data:
+            return
+        os.makedirs(self.replay_dir, exist_ok=True)
+        manifest = {'shards': []}
+        if os.path.exists(self.replay_manifest_path):
+            with open(self.replay_manifest_path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
 
-        这是 AlphaZero 训练的关键：旧模型生成的数据质量低，
-        长期保留会导致模型在过时数据上反复训练，阻碍收敛。
-        """
-        if len(self.replay_buffer) > keep_recent:
-            # deque 支持从左侧高效弹出
-            while len(self.replay_buffer) > keep_recent:
-                self.replay_buffer.popleft()
-            print(f"[训练] replay buffer 已裁剪至 {len(self.replay_buffer)} 条")
+        shard_name = f"shard_iter_{iteration:05d}_{time.time_ns()}.pkl"
+        shard_path = os.path.join(self.replay_dir, shard_name)
+        temp_shard_path = f"{shard_path}.tmp"
+        with open(temp_shard_path, 'wb') as f:
+            pickle.dump(new_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temp_shard_path, shard_path)
+        manifest['shards'].append({'file': shard_name, 'count': len(new_data)})
 
-    def _save_replay_buffer(self):
-        """将 replay buffer 保存到磁盘。"""
-        buffer_path = os.path.join(self.save_dir, 'replay_buffer.pkl')
-        try:
-            with open(buffer_path, 'wb') as f:
-                pickle.dump(list(self.replay_buffer), f)
-            print(f"[训练] replay buffer 已保存: {buffer_path} ({len(self.replay_buffer)} 条样本)")
-        except Exception as e:
-            print(f"[训练] replay buffer 保存失败: {e}")
+        total = sum(item['count'] for item in manifest['shards'])
+        removed_shards = []
+        while total > self.replay_window_size and len(manifest['shards']) > 1:
+            shard = manifest['shards'].pop(0)
+            total -= shard['count']
+            removed_shards.append(shard['file'])
 
-    def _load_replay_buffer(self, path: str):
-        """从磁盘加载 replay buffer。"""
-        try:
-            with open(path, 'rb') as f:
-                data = pickle.load(f)
-            self.replay_buffer.extend(data)
-            print(f"[训练] replay buffer 已加载: {path} ({len(self.replay_buffer)} 条样本)")
-        except Exception as e:
-            print(f"[训练] replay buffer 加载失败: {e}")
+        manifest['sample_count'] = total
+        temp_manifest = self.replay_manifest_path + '.tmp'
+        with open(temp_manifest, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        os.replace(temp_manifest, self.replay_manifest_path)
+        for shard_name_to_remove in removed_shards:
+            shard_path_to_remove = os.path.join(self.replay_dir, shard_name_to_remove)
+            if os.path.exists(shard_path_to_remove):
+                os.remove(shard_path_to_remove)
+        print(
+            f"[训练] replay 增量分片已保存: {shard_name} "
+            f"(+{len(new_data)}，磁盘保留约 {total} 条)"
+        )
+
+    def _load_replay_source(self, path: str):
+        """加载 replay 目录或 manifest。"""
+        if os.path.isdir(path):
+            manifest_path = os.path.join(path, 'manifest.json')
+            self._load_replay_shards(manifest_path)
+        elif path.endswith('.json'):
+            self._load_replay_shards(path)
+        else:
+            raise ValueError("replay 路径必须是目录或 manifest.json")
+
+    def _load_replay_shards(self, manifest_path: str):
+        """按 manifest 顺序恢复增量 replay 分片。"""
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            manifest = json.load(f)
+        replay_dir = os.path.dirname(manifest_path)
+        for shard in manifest.get('shards', []):
+            with open(os.path.join(replay_dir, shard['file']), 'rb') as f:
+                samples = pickle.load(f)
+            self.replay_buffer.extend(samples)
+        print(
+            f"[训练] replay 分片已加载: {manifest_path} "
+            f"({len(self.replay_buffer)} 条样本)"
+        )
 
     def _get_material_weight(self, iteration: int) -> float:
         """
@@ -652,8 +873,13 @@ class TrainingPipeline:
         print(f"配置:")
         print(f"  模型: ResNet-{self.num_blocks}x{self.channels}")
         print(f"  MCTS 模拟次数: {self.num_simulations}")
+        print(f"  MCTS 推理批大小: {self.inference_batch_size}")
+        print(f"  推理缓存容量: {self.inference_cache_size}")
+        print(f"  评估 MCTS 模拟次数: {self.eval_simulations}")
         print(f"  每轮自对弈: {self.self_play_games} 局")
+        print(f"  每轮训练 batch 数: {self.training_steps}")
         print(f"  训练批大小: {self.batch_size}")
+        print(f"  数据加载进程: {self.data_workers}")
         print(f"  学习率: {self.learning_rate}")
         print(f"  总迭代次数: {num_iterations}")
         if self.material_warmup > 0:
@@ -661,9 +887,12 @@ class TrainingPipeline:
         print("=" * 60)
 
         # 记录上次评估通过时的状态（用于评估失败时回滚）
-        accepted_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+        accepted_model_state = {
+            key: value.clone() for key, value in self.model.state_dict().items()
+        }
         accepted_optimizer_state = copy.deepcopy(self.trainer.optimizer.state_dict())
         accepted_scheduler_state = copy.deepcopy(self.trainer.scheduler.state_dict())
+        accepted_scaler_state = copy.deepcopy(self.trainer.scaler.state_dict())
 
         for iteration in range(self.start_iteration, num_iterations + 1):
             print(f"\n{'='*60}")
@@ -680,71 +909,93 @@ class TrainingPipeline:
 
             # 步骤1：自对弈生成训练数据
             print("\n[步骤1] 自对弈中...")
+            self_play_start = time.time()
             game_data = self.self_play_worker.play_multiple_games(self.self_play_games)
+            self_play_elapsed = time.time() - self_play_start
             
             # 添加到经验回放缓冲区
             self.replay_buffer.extend(game_data)
-            # 裁剪旧数据，防止过时数据稀释新学习
-            self._trim_replay_buffer(keep_recent=self.buffer_size * 2 // 3)
             print(f"  新增样本: {len(game_data)}，缓冲区大小: {len(self.replay_buffer)}")
+            print(f"  自对弈耗时: {self_play_elapsed:.1f} 秒")
             
             # 步骤2：训练神经网络
             print("\n[步骤2] 训练神经网络...")
+            training_start = time.time()
             if len(self.replay_buffer) >= self.batch_size * 10:
                 dataset = GameDataset(list(self.replay_buffer))
+                sampler = RandomSampler(
+                    dataset,
+                    replacement=True,
+                    num_samples=self.training_steps * self.batch_size,
+                )
                 dataloader = DataLoader(
                     dataset, 
                     batch_size=self.batch_size,
-                    shuffle=True,
-                    num_workers=2,
-                    pin_memory=True,
+                    sampler=sampler,
+                    num_workers=self.data_workers,
+                    pin_memory=self.device == 'cuda',
+                    persistent_workers=self.data_workers > 0,
+                    drop_last=True,
                 )
-                
-                for epoch in range(1, self.training_epochs + 1):
-                    metrics = self.trainer.train_epoch(dataloader, epoch)
-                    print(f"  Epoch {epoch}: loss={metrics['loss']:.4f}, "
-                          f"policy={metrics['policy_loss']:.4f}, "
-                          f"value={metrics['value_loss']:.4f}")
+
+                metrics = self.trainer.train_iteration(dataloader, iteration)
+                print(f"  {self.training_steps} batches: loss={metrics['loss']:.4f}, "
+                      f"policy={metrics['policy_loss']:.4f}, "
+                      f"value={metrics['value_loss']:.4f}")
             else:
                 print(f"  样本不足（需要至少 {self.batch_size * 10}），跳过训练")
+            print(f"  网络训练耗时: {time.time() - training_start:.1f} 秒")
             
             # 步骤3：评估新模型
             if iteration % self.evaluate_every == 0:
                 print("\n[步骤3] 评估新模型...")
-                # 创建旧模型副本（使用上次评估通过的权重）
-                old_model = create_model(self.num_blocks, self.channels, device=self.device)
-                old_model.load_state_dict(accepted_model_state)
+                evaluation_start = time.time()
+                # 创建当前基准模型副本（使用上次评估通过的权重）
+                reference_model = create_model(
+                    self.num_blocks, self.channels, device=self.device
+                )
+                reference_model.load_state_dict(accepted_model_state)
 
-                eval_result = self.evaluator.evaluate(self.model, old_model)
-                print(f"  胜率: {eval_result['win_rate']:.1%}")
-                print(f"  新模型胜: {eval_result['new_wins']}, "
-                      f"旧模型胜: {eval_result['old_wins']}, "
+                eval_result = self.evaluator.evaluate(self.model, reference_model)
+                print(f"  纯胜率: {eval_result['win_rate']:.1%}")
+                print(f"  计分率（和棋计半分）: {eval_result['score_rate']:.1%}")
+                print(f"  候选模型胜: {eval_result['candidate_wins']}, "
+                      f"基准模型胜: {eval_result['reference_wins']}, "
                       f"和棋: {eval_result['draws']}")
+                print(f"  模型评估耗时: {time.time() - evaluation_start:.1f} 秒")
 
                 if eval_result['accepted']:
                     print("  ✅ 新模型已接受")
                     # 更新 accepted 状态为当前模型
-                    accepted_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+                    accepted_model_state = {
+                        key: value.clone()
+                        for key, value in self.model.state_dict().items()
+                    }
                     accepted_optimizer_state = copy.deepcopy(self.trainer.optimizer.state_dict())
                     accepted_scheduler_state = copy.deepcopy(self.trainer.scheduler.state_dict())
+                    accepted_scaler_state = copy.deepcopy(
+                        self.trainer.scaler.state_dict()
+                    )
                 else:
                     print("  ❌ 新模型未达标，回滚到上次通过的模型")
                     self.model.load_state_dict(accepted_model_state)
                     self.trainer.optimizer.load_state_dict(accepted_optimizer_state)
                     self.trainer.scheduler.load_state_dict(accepted_scheduler_state)
+                    self.trainer.scaler.load_state_dict(accepted_scaler_state)
             
             # 保存检查点
-            additional_info = {'iteration': iteration}
             if iteration % 5 == 0:
                 checkpoint_path = os.path.join(self.save_dir, f'checkpoint_iter_{iteration}.pt')
-                self.trainer.save_checkpoint(checkpoint_path, iteration, additional_info)
+                self.trainer.save_checkpoint(checkpoint_path, iteration)
 
             # 保存最新模型
             latest_path = os.path.join(self.save_dir, 'latest_model.pt')
-            self.trainer.save_checkpoint(latest_path, iteration, additional_info)
+            self.trainer.save_checkpoint(latest_path, iteration)
 
-            # 保存 replay buffer
-            self._save_replay_buffer()
+            # 增量保存本轮 replay 分片，避免每轮重写整个缓冲区。
+            replay_save_start = time.time()
+            self._save_replay_shard(game_data, iteration)
+            print(f"  replay 保存耗时: {time.time() - replay_save_start:.1f} 秒")
             
             elapsed = time.time() - start_time
             print(f"\n本轮耗时: {elapsed:.1f} 秒")
@@ -760,12 +1011,17 @@ def train_from_scratch():
         num_blocks=10,         # 残差块数量
         channels=256,          # 特征通道数
         num_simulations=400,   # MCTS 模拟次数
+        inference_batch_size=64, # MCTS GPU 推理批大小
+        inference_cache_size=10000, # 当前模型权重的 LRU 局面数
+        eval_simulations=200,   # 评估使用较少模拟，降低门控成本
         self_play_games=25,    # 每轮自对弈局数
-        training_epochs=5,     # 每轮训练 epoch 数
+        training_steps=500,    # 每轮固定随机训练 batch 数
         batch_size=256,        # 批大小（RTX 5070 12GB 足够）
+        data_workers=4,        # 并行准备训练 batch
         learning_rate=0.001,   # 初始学习率
         buffer_size=100000,    # 经验回放缓冲区大小
         evaluate_every=2,      # 每2轮评估一次
+        material_warmup=80,    # 前80轮材料评估线性 warmup
         save_dir='models',     # 模型保存目录
         num_iterations=100,    # 总迭代次数
     )

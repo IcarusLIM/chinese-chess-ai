@@ -22,10 +22,13 @@ import os
 import json
 import time
 import uuid
+import secrets
+import sqlite3
+import torch
 from flask import Flask, render_template, request, jsonify, session
 from game import Game
-from network import create_model, PolicyValueNet
-from mcts import MCTS, MCTSEvaluator
+from network import create_model, create_model_from_checkpoint
+from mcts import MCTSEvaluator
 from move_index import get_move_index
 from constants import PIECE_NAMES, PIECE_SYMBOLS, BOARD_ROWS, BOARD_COLS
 
@@ -33,15 +36,113 @@ from constants import PIECE_NAMES, PIECE_SYMBOLS, BOARD_ROWS, BOARD_COLS
 # Flask 应用初始化
 # ============================================================
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+os.makedirs(app.instance_path, exist_ok=True)
+
+
+def _load_secret_key() -> str:
+    """优先使用环境变量，否则使用跨重启持久化的本地密钥。"""
+    configured = os.environ.get('CHINESE_CHESS_SECRET_KEY')
+    if configured:
+        return configured
+    key_path = os.path.join(app.instance_path, 'secret_key')
+    try:
+        with open(key_path, 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        key = secrets.token_hex(32)
+        # 独占创建，避免多个 worker 首次启动时相互覆盖。
+        try:
+            fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(key)
+            return key
+        except FileExistsError:
+            with open(key_path, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+
+
+app.secret_key = _load_secret_key()
 
 # AI 引擎（共享，无状态）
 ai_evaluator = None
 move_index = None
 
-# 每会话游戏状态
-games = {}
+# 每会话游戏状态持久化到 SQLite，可跨进程和服务重启共享。
 MAX_GAMES = 100
+
+
+def _serialize_game(game: Game) -> str:
+    return json.dumps({
+        'board': game.board,
+        'red_to_move': game.red_to_move,
+        'move_history': game.move_history,
+        'hash_history': game.hash_history,
+        'current_hash': game.current_hash,
+        'halfmove_clock': game.halfmove_clock,
+        'fullmove_number': game.fullmove_number,
+    }, separators=(',', ':'))
+
+
+def _deserialize_game(payload: str) -> Game:
+    data = json.loads(payload)
+    game = Game.__new__(Game)
+    game.board = data['board']
+    game.red_to_move = data['red_to_move']
+    game.move_history = [
+        (tuple(item[0]), tuple(item[1]), item[2], item[3], item[4])
+        for item in data['move_history']
+    ]
+    game.hash_history = data['hash_history']
+    game.current_hash = data['current_hash']
+    game.halfmove_clock = data['halfmove_clock']
+    game.fullmove_number = data['fullmove_number']
+    return game
+
+
+class GameStore:
+    """SQLite 棋局仓库；每次操作使用独立连接以支持多 worker。"""
+
+    def __init__(self, path: str, max_games: int):
+        self.path = path
+        self.max_games = max_games
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                'CREATE TABLE IF NOT EXISTS games ('
+                'sid TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at REAL NOT NULL)'
+            )
+
+    def _connect(self):
+        conn = sqlite3.connect(self.path, timeout=30)
+        conn.execute('PRAGMA journal_mode=WAL')
+        return conn
+
+    def load(self, sid: str):
+        with self._connect() as conn:
+            row = conn.execute('SELECT state FROM games WHERE sid = ?', (sid,)).fetchone()
+        return _deserialize_game(row[0]) if row else None
+
+    def save(self, sid: str, game: Game):
+        with self._connect() as conn:
+            conn.execute(
+                'INSERT INTO games(sid, state, updated_at) VALUES (?, ?, ?) '
+                'ON CONFLICT(sid) DO UPDATE SET '
+                'state=excluded.state, updated_at=excluded.updated_at',
+                (sid, _serialize_game(game), time.time()),
+            )
+            count = conn.execute('SELECT COUNT(*) FROM games').fetchone()[0]
+            if count > self.max_games:
+                conn.execute(
+                    'DELETE FROM games WHERE sid IN ('
+                    'SELECT sid FROM games ORDER BY updated_at ASC LIMIT ?) ',
+                    (count - self.max_games,),
+                )
+
+
+database_path = os.environ.get(
+    'CHINESE_CHESS_DB', os.path.join(app.instance_path, 'games.sqlite3')
+)
+game_store = GameStore(database_path, MAX_GAMES)
 
 
 def get_game():
@@ -49,43 +150,54 @@ def get_game():
     if 'sid' not in session:
         session['sid'] = str(uuid.uuid4())
     sid = session['sid']
-    if sid not in games:
-        if len(games) >= MAX_GAMES:
-            oldest = next(iter(games))
-            del games[oldest]
-        games[sid] = Game()
-    return games[sid]
+    game = game_store.load(sid)
+    if game is None:
+        game = Game()
+        game_store.save(sid, game)
+    return game
 
 
-def init_ai(model_path: str = None, num_simulations: int = 200):
+def save_game(game: Game):
+    """保存当前会话棋局。"""
+    game_store.save(session['sid'], game)
+
+
+def init_ai(model_path: str = None, num_simulations: int = 200,
+            inference_batch_size: int = 64,
+            inference_cache_size: int = 10000):
     """
     初始化 AI 引擎。
     
     Args:
         model_path: 模型文件路径（None 则使用随机初始化的模型）
         num_simulations: MCTS 模拟次数（越多越强但越慢）
+        inference_batch_size: GPU 叶节点推理批大小
+        inference_cache_size: 当前模型的 LRU 局面缓存容量
     """
     global ai_evaluator, move_index
     
     move_index = get_move_index()
     
     # 创建模型
-    device = 'cuda' if __import__('torch').cuda.is_available() else 'cpu'
-    model = create_model(num_blocks=10, channels=256, device=device)
-    
-    # 加载训练好的模型（如果存在）
-    if model_path and os.path.exists(model_path):
-        checkpoint = __import__('torch').load(model_path, map_location=device)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"[Web] 已加载模型: {model_path}")
-        else:
-            print(f"[Web] 模型格式不正确，使用随机初始化")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    if model_path:
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"模型文件不存在: {model_path}")
+        model = create_model_from_checkpoint(model_path, device)
     else:
-        print(f"[Web] 未找到模型文件，使用随机初始化（AI 走子将随机）")
+        model = create_model(num_blocks=10, channels=256, device=device)
+        print(f"[Web] 未指定模型文件，使用随机初始化（AI 走子将随机）")
     
-    ai_evaluator = MCTSEvaluator(model, num_simulations=num_simulations)
-    print(f"[Web] AI 引擎初始化完成，MCTS 模拟次数: {num_simulations}")
+    ai_evaluator = MCTSEvaluator(
+        model, num_simulations=num_simulations,
+        inference_batch_size=inference_batch_size,
+        inference_cache_size=inference_cache_size,
+    )
+    print(
+        f"[Web] AI 引擎初始化完成，MCTS 模拟次数: {num_simulations}，"
+        f"推理批大小: {inference_batch_size}"
+    )
 
 
 def _build_move_history(game: Game) -> list:
@@ -168,10 +280,11 @@ def new_game():
     """
     sid = session.get('sid', str(uuid.uuid4()))
     session['sid'] = sid
-    games[sid] = Game()
+    game = Game()
+    game_store.save(sid, game)
     return jsonify({
         'success': True,
-        'state': game_state_to_dict(games[sid]),
+        'state': game_state_to_dict(game),
     })
 
 
@@ -205,6 +318,7 @@ def player_move():
     
     # 执行走子
     captured = current_game.make_move(from_pos, to_pos, validate=False)
+    save_game(current_game)
     
     return jsonify({
         'success': True,
@@ -252,6 +366,7 @@ def ai_move():
     
     # 执行走子
     captured = current_game.make_move(from_pos, to_pos, validate=False)
+    save_game(current_game)
     
     return jsonify({
         'success': True,
@@ -280,6 +395,7 @@ def undo_move():
     for _ in range(2):
         if current_game.undo_move():
             undone += 1
+    save_game(current_game)
     
     return jsonify({
         'success': True,
@@ -422,6 +538,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='中国象棋 AI Web 服务器')
     parser.add_argument('--model', type=str, default=None, help='模型文件路径')
     parser.add_argument('--simulations', type=int, default=200, help='MCTS 模拟次数')
+    parser.add_argument('--inference-batch-size', type=int, default=64, help='MCTS GPU 叶节点推理批大小')
+    parser.add_argument('--inference-cache-size', type=int, default=10000, help='LRU 局面缓存容量')
     parser.add_argument('--port', type=int, default=5000, help='服务器端口')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='服务器地址')
     parser.add_argument('--debug', action='store_true', help='调试模式')
@@ -429,7 +547,11 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     # 初始化 AI
-    init_ai(model_path=args.model, num_simulations=args.simulations)
+    init_ai(
+        model_path=args.model, num_simulations=args.simulations,
+        inference_batch_size=args.inference_batch_size,
+        inference_cache_size=args.inference_cache_size,
+    )
     
     # 启动服务器
     print(f"\n[Web] 服务器启动于 http://{args.host}:{args.port}")

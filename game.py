@@ -13,7 +13,7 @@
   - Game: 单局游戏状态，支持走子、悔棋、局面序列化
 """
 
-import copy
+import numpy as np
 from typing import List, Tuple, Optional, Set
 from constants import *
 
@@ -683,13 +683,8 @@ class Game:
             - (True, 'draw'): 和棋
             - (False, None): 游戏未结束
         """
-        # 检查将死
-        if self.is_checkmate():
-            winner = 'black_wins' if self.red_to_move else 'red_wins'
-            return (True, winner)
-        
-        # 检查困毙
-        if self.is_stalemate():
+        # 中国象棋中无合法走法必败，无需分别重复生成走法判断将死/困毙。
+        if not self.get_legal_moves():
             winner = 'black_wins' if self.red_to_move else 'red_wins'
             return (True, winner)
         
@@ -752,7 +747,7 @@ class Game:
         fen += " w" if self.red_to_move else " b"
         return fen
     
-    def get_board_tensor(self) -> 'list':
+    def get_board_tensor(self) -> np.ndarray:
         """
         将棋盘状态编码为神经网络输入格式。
 
@@ -762,22 +757,19 @@ class Game:
         - 通道 14：当前走棋方（红方走棋全 1，黑方走棋全 0）
 
         Returns:
-            15x10x9 的三维列表
+            float32 格式的 15x10x9 NumPy 数组
         """
-        tensor = [[[0.0] * BOARD_COLS for _ in range(BOARD_ROWS)] for _ in range(15)]
+        tensor = np.zeros((15, BOARD_ROWS, BOARD_COLS), dtype=np.float32)
 
         for row in range(BOARD_ROWS):
             for col in range(BOARD_COLS):
                 piece = self.board[row][col]
                 if piece != EMPTY:
                     channel = piece - 1  # 编码 1-14 → 通道 0-13
-                    tensor[channel][row][col] = 1.0
+                    tensor[channel, row, col] = 1.0
 
         # 第 15 通道：当前走棋方
-        turn_value = 1.0 if self.red_to_move else 0.0
-        for row in range(BOARD_ROWS):
-            for col in range(BOARD_COLS):
-                tensor[14][row][col] = turn_value
+        tensor[14, :, :] = 1.0 if self.red_to_move else 0.0
 
         return tensor
     

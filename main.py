@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 def cmd_train(args):
     """训练模式"""
     from trainer import TrainingPipeline
-    
+
     print("=" * 60)
     print("中国象棋 AI - 训练模式")
     print("=" * 60)
@@ -36,9 +36,13 @@ def cmd_train(args):
         num_blocks=args.blocks,
         channels=args.channels,
         num_simulations=args.simulations,
+        inference_batch_size=args.inference_batch_size,
+        inference_cache_size=args.inference_cache_size,
+        eval_simulations=args.eval_simulations,
         self_play_games=args.self_play_games,
-        training_epochs=args.epochs,
+        training_steps=args.training_steps,
         batch_size=args.batch_size,
+        data_workers=args.data_workers,
         learning_rate=args.lr,
         save_dir=args.save_dir,
         resume_from=args.resume,
@@ -59,7 +63,11 @@ def cmd_web(args):
     print("中国象棋 AI - Web 对弈模式")
     print("=" * 60)
     
-    init_ai(model_path=args.model, num_simulations=args.simulations)
+    init_ai(
+        model_path=args.model, num_simulations=args.simulations,
+        inference_batch_size=args.inference_batch_size,
+        inference_cache_size=args.inference_cache_size,
+    )
     
     print(f"\n在浏览器中打开: http://localhost:{args.port}")
     print("按 Ctrl+C 停止服务器\n")
@@ -70,7 +78,7 @@ def cmd_web(args):
 def cmd_play(args):
     """控制台对弈模式（调试用）"""
     from game import Game
-    from network import create_model
+    from network import create_model, create_model_from_checkpoint
     from mcts import MCTSEvaluator
     from move_index import get_move_index
     import torch
@@ -85,15 +93,18 @@ def cmd_play(args):
     
     # 初始化
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = create_model(num_blocks=10, channels=256, device=device)
-    
-    if args.model and os.path.exists(args.model):
-        checkpoint = torch.load(args.model, map_location=device)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"已加载模型: {args.model}")
-    
-    evaluator = MCTSEvaluator(model, num_simulations=args.simulations)
+    if args.model:
+        if not os.path.exists(args.model):
+            raise FileNotFoundError(f"模型文件不存在: {args.model}")
+        model = create_model_from_checkpoint(args.model, device)
+    else:
+        model = create_model(num_blocks=10, channels=256, device=device)
+
+    evaluator = MCTSEvaluator(
+        model, num_simulations=args.simulations,
+        inference_batch_size=args.inference_batch_size,
+        inference_cache_size=args.inference_cache_size,
+    )
     game = Game()
     
     while True:
@@ -162,19 +173,40 @@ def main():
     train_parser.add_argument('--blocks', type=int, default=10, help='残差块数量')
     train_parser.add_argument('--channels', type=int, default=256, help='特征通道数')
     train_parser.add_argument('--simulations', type=int, default=400, help='MCTS 模拟次数')
+    train_parser.add_argument(
+        '--inference-batch-size', type=int, default=64,
+        help='MCTS GPU 叶节点推理批大小',
+    )
+    train_parser.add_argument(
+        '--inference-cache-size', type=int, default=10000,
+        help='当前模型权重的 LRU 局面缓存容量',
+    )
+    train_parser.add_argument('--eval-simulations', type=int, default=200, help='模型评估时每步 MCTS 模拟次数')
     train_parser.add_argument('--self-play-games', type=int, default=25, help='每轮自对弈局数')
-    train_parser.add_argument('--epochs', type=int, default=5, help='每轮训练 epoch 数')
+    train_parser.add_argument('--training-steps', type=int, default=500, help='每轮随机训练 batch 数')
     train_parser.add_argument('--batch-size', type=int, default=256, help='训练批大小')
+    train_parser.add_argument('--data-workers', type=int, default=4, help='训练数据加载进程数')
     train_parser.add_argument('--lr', type=float, default=0.001, help='学习率')
     train_parser.add_argument('--save-dir', type=str, default='models', help='模型保存目录')
     train_parser.add_argument('--resume', type=str, default=None, help='从指定 checkpoint 继续训练')
-    train_parser.add_argument('--load-buffer', type=str, default=None, help='从指定文件加载 replay buffer')
-    train_parser.add_argument('--material-warmup', type=int, default=0, help='材料评估 warmup 迭代数（0=不启用）')
+    train_parser.add_argument(
+        '--load-buffer', type=str, default=None,
+        help='从 replay 目录或 manifest 加载数据',
+    )
+    train_parser.add_argument(
+        '--material-warmup', type=int, default=80,
+        help='材料评估 warmup 迭代数（默认 80，0=不启用）',
+    )
     
     # === web 子命令 ===
     web_parser = subparsers.add_parser('web', help='Web 对弈界面')
     web_parser.add_argument('--model', type=str, default=None, help='模型文件路径')
     web_parser.add_argument('--simulations', type=int, default=200, help='MCTS 模拟次数')
+    web_parser.add_argument(
+        '--inference-batch-size', type=int, default=64,
+        help='MCTS GPU 叶节点推理批大小',
+    )
+    web_parser.add_argument('--inference-cache-size', type=int, default=10000, help='LRU 局面缓存容量')
     web_parser.add_argument('--port', type=int, default=5000, help='服务器端口')
     web_parser.add_argument('--host', type=str, default='0.0.0.0', help='服务器地址')
     web_parser.add_argument('--debug', action='store_true', help='调试模式')
@@ -183,6 +215,11 @@ def main():
     play_parser = subparsers.add_parser('play', help='控制台对弈')
     play_parser.add_argument('--model', type=str, default=None, help='模型文件路径')
     play_parser.add_argument('--simulations', type=int, default=200, help='MCTS 模拟次数')
+    play_parser.add_argument(
+        '--inference-batch-size', type=int, default=64,
+        help='MCTS GPU 叶节点推理批大小',
+    )
+    play_parser.add_argument('--inference-cache-size', type=int, default=10000, help='LRU 局面缓存容量')
     
     args = parser.parse_args()
     

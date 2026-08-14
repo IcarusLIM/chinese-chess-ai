@@ -8,8 +8,8 @@
 
   - 策略头（Policy Head）：输出每个走法的概率分布
   - 价值头（Value Head）：输出当前局面的评估值 [-1, 1]
-    - +1 表示红方必胜
-    - -1 表示黑方必胜
+    - +1 表示当前走棋方占优/获胜
+    - -1 表示当前走棋方劣势/失败
     - 0 表示均势
 
 设计选择：
@@ -28,7 +28,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+import numpy as np
+from typing import List, Tuple
 from constants import BOARD_ROWS, BOARD_COLS
 from move_index import get_move_index
 
@@ -104,6 +105,8 @@ class PolicyValueNet(nn.Module):
             channels: 特征通道数（更多通道 = 更强但更占显存）
         """
         super().__init__()
+        self.num_blocks = num_blocks
+        self.channels = channels
         
         # 获取走法总数（网络输出维度）
         mi = get_move_index()
@@ -183,22 +186,36 @@ class PolicyValueNet(nn.Module):
             - policy_probs: 长度为 num_moves 的概率列表
             - value: 局面评估值 [-1, 1]
         """
+        policies, values = self.predict_batch([board_tensor])
+        return policies[0], values[0]
+
+    def predict_batch(self, board_tensors: List['list']) -> Tuple[np.ndarray, np.ndarray]:
+        """批量推理接口；一次 GPU 调用评估多个 MCTS 叶节点。"""
+        if not board_tensors:
+            return (
+                np.empty((0, self.num_moves), dtype=np.float32),
+                np.empty((0,), dtype=np.float32),
+            )
+
         self.eval()
-        with torch.no_grad():
-            # 转换为张量并添加 batch 维度
-            x = torch.tensor(board_tensor, dtype=torch.float32).unsqueeze(0)
-            x = x.to(next(self.parameters()).device)
-            
-            # channels_last 内存格式（RTX 5070 优化）
-            x = x.to(memory_format=torch.channels_last)
-            
-            policy, value = self.forward(x)
-            
-            # 转换为概率分布
-            policy_probs = F.softmax(policy, dim=1).squeeze(0).cpu().tolist()
-            value_scalar = value.item()
-        
-        return policy_probs, value_scalar
+        device = next(self.parameters()).device
+        states = np.asarray(board_tensors, dtype=np.float32)
+        x = torch.from_numpy(states).to(device)
+        x = x.to(memory_format=torch.channels_last)
+
+        use_amp = device.type == 'cuda'
+        with torch.inference_mode(), torch.amp.autocast(
+            'cuda', dtype=torch.float16, enabled=use_amp
+        ):
+            policy_logits, values = self.forward(x)
+            policy_probs = F.softmax(policy_logits, dim=1)
+
+        # 每个 batch 只同步一次 GPU；有限值检查在 CPU 上完成。
+        policies_cpu = policy_probs.float().cpu().numpy()
+        values_cpu = values.squeeze(-1).float().cpu().numpy()
+        if not np.isfinite(policies_cpu).all() or not np.isfinite(values_cpu).all():
+            raise FloatingPointError("模型推理输出出现 NaN/Inf，请勿继续使用该检查点")
+        return policies_cpu, values_cpu
     
     def count_parameters(self) -> int:
         """统计模型参数量"""
@@ -210,8 +227,8 @@ class PolicyValueNet(nn.Module):
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return (
             f"PolicyValueNet:\n"
-            f"  残差块数: {len(self.residual_blocks)}\n"
-            f"  特征通道: {self.residual_blocks[0].conv1.in_channels}\n"
+            f"  残差块数: {self.num_blocks}\n"
+            f"  特征通道: {self.channels}\n"
             f"  走法数量: {self.num_moves}\n"
             f"  总参数量: {total_params:,}\n"
             f"  可训练参数: {trainable_params:,}\n"
@@ -241,6 +258,10 @@ def create_model(num_blocks: int = 10, channels: int = 256, device: str = 'cuda'
     
     # 移动到 GPU
     if device == 'cuda' and torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision('high')
         model = model.cuda()
         # 使用 channels_last 内存格式（NVIDIA GPU 优化）
         model = model.to(memory_format=torch.channels_last)
@@ -249,6 +270,26 @@ def create_model(num_blocks: int = 10, channels: int = 256, device: str = 'cuda'
         print("[模型] 已创建，使用 CPU 推理")
     
     print(model.get_model_info())
+    return model
+
+
+def read_checkpoint(path: str, device: str):
+    """读取训练检查点；其字段结构由当前训练流程统一定义。"""
+    return torch.load(path, map_location=device)
+
+
+def create_model_from_checkpoint(path: str, device: str) -> PolicyValueNet:
+    """按检查点记录的网络结构创建模型并加载权重。"""
+    checkpoint = read_checkpoint(path, device)
+    config = checkpoint['model_config']
+    model = create_model(
+        num_blocks=config['num_blocks'],
+        channels=config['channels'],
+        device=device,
+    )
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    print(f"[模型] 已加载检查点: {path}")
     return model
 
 
