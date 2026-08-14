@@ -47,6 +47,7 @@ chinese-chess-ai/
 ├── network.py           # 神经网络模型（ResNet 策略-价值网络）
 ├── mcts.py              # 蒙特卡洛树搜索（MCTS）
 ├── trainer.py           # 自对弈训练流水线
+├── benchmark_self_play.py # 串行/并行自对弈吞吐基准
 ├── requirements.txt     # Python 依赖
 ├── README.md            # 本文档
 ├── web/
@@ -64,8 +65,8 @@ chinese-chess-ai/
 ### 环境要求
 
 - Python 3.9+
-- NVIDIA GPU（推荐 RTX 5070 或同等级，12GB+ VRAM）
-- CUDA 12.x
+- NVIDIA GPU（推荐 RTX 5070 或同等级，12GB+ VRAM）或 Apple Silicon GPU
+- CUDA 12.x（NVIDIA）；macOS 自动使用 PyTorch MPS
 
 ### 安装
 
@@ -74,7 +75,8 @@ chinese-chess-ai/
 cd chinese-chess-ai
 
 # 安装依赖
-pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
 ### 运行 Web 对弈（使用随机模型）
@@ -97,6 +99,9 @@ python main.py train
 
 # 快速实验（减少参数）
 python main.py train --iterations 20 --blocks 5 --channels 128 --simulations 100 --self-play-games 10
+
+# 根据 CPU 核数和显存调整并行 actor 与集中推理 batch
+python main.py train --self-play-workers 4 --inference-server-batch-size 256
 
 # 训练完成后启动 Web 对弈
 python main.py web --model models/latest_model.pt
@@ -237,7 +242,9 @@ ResBlock × 10                  ← 10个残差块（特征提取）
 
 ```
 for 迭代 in range(100):
-    1. 自对弈：当前模型 × 当前模型 → 生成训练数据
+    1. 自对弈：多个 CPU actor 并行构建搜索树
+       → 主进程集中合并叶节点并执行一次 GPU 推理
+       → 当前模型 × 当前模型生成训练数据
        （可选：材料评估 warmup 混合启发式评估）
     2. 训练：从经验回放缓冲区随机采样固定数量的 batch
     3. 评估：在固定多开局中交换红黑，候选模型 vs 当前基准模型成对对弈
@@ -262,12 +269,17 @@ Loss = 策略损失(交叉熵) + 价值损失(MSE) + L2正则化
 | `num_simulations` | 400 | MCTS 模拟次数，越多越精确 |
 | `inference_batch_size` | 64 | 单次 GPU 推理合并的 MCTS 叶节点数 |
 | `inference_cache_size` | 10000 | 当前模型权重的 LRU 网络评估缓存容量 |
+| `self_play_workers` | 4 | 并行生成自对弈搜索树的 CPU actor 数量 |
+| `inference_server_batch_size` | 256 | 主进程集中式 GPU 推理最大 batch |
 | `eval_simulations` | 200 | 模型评估时每步 MCTS 模拟次数 |
 | `self_play_games` | 25 | 每轮自对弈局数 |
 | `training_steps` | 500 | 每轮从 replay 随机训练的 batch 数 |
 | `batch_size` | 256 | 训练批大小（RTX 5070 12GB 足够） |
 | `data_workers` | 4 | 训练数据加载进程数 |
 | `learning_rate` | 0.001 | 初始学习率，随训练衰减 |
+| `buffer_size` | 20000 | 只保留最近的 replay 样本窗口 |
+| `recent_window_size` | 5000 | 分层采样中定义为“近期”的末尾样本数 |
+| `recent_sample_fraction` | 0.5 | 每轮训练分配给近期窗口的采样概率 |
 | `c_puct` | 1.5 | MCTS 探索常数 |
 | `temperature` | 1.0→0.01 | 温度参数，训练时先高后低 |
 | `--resume` | — | 从指定 checkpoint 继续训练（恢复模型、优化器、迭代编号） |
@@ -276,13 +288,19 @@ Loss = 策略损失(交叉熵) + 价值损失(MSE) + L2正则化
 
 ## RTX 5070 训练建议
 
-MCTS 默认以 64 个叶节点为一批执行 FP16 GPU 推理，并在实际落子后复用搜索子树。
-400 次模拟通常只需要约 7 次批量叶节点推理，而不是逐叶执行约 400 次推理。
-同一组模型权重还会使用有界 LRU 缓存复用重复局面的原始网络输出；模型更新后自动清空。
+自对弈默认启动 4 个 CPU actor。actor 并行完成规则生成和树遍历，主进程持有唯一模型，
+将不同 actor 的叶节点请求合并成最多 256 个局面的 GPU batch，因此不会为每个进程复制
+CUDA 模型。单个 actor 内仍以最多 64 个叶节点为一批搜索并复用实际落子后的子树。
+同一组模型权重还会使用有界 LRU 缓存复用重复局面的原始网络输出。
 
 不同 CUDA/PyTorch 版本和棋局平均长度差异很大，因此不再给出未经实测的每轮耗时。
-训练日志会分别输出自对弈、网络训练和模型评估耗时。显存充足但 GPU 利用率偏低时，
-可尝试 `--inference-batch-size 128`；显存不足时降为 32。
+训练日志会输出集中式推理的实际平均 batch。CPU 核数较多时可增加
+`--self-play-workers`；GPU 仍有余量时增加 `--inference-server-batch-size`。显存不足时优先
+降低集中式 batch，再降低 `--inference-batch-size`。可用下面的命令先做本机对照：
+
+```bash
+.venv/bin/python benchmark_self_play.py --games 4 --moves 20 --simulations 64
+```
 
 | 配置 | blocks | channels | simulations | 推理批大小 | 训练 batch |
 |------|--------|----------|-------------|------------|------------|
@@ -297,7 +315,9 @@ MCTS 默认以 64 个叶节点为一批执行 FP16 GPU 推理，并在实际落�
 - 2238 位合法走法掩码使用 `packbits` 压缩。
 - 每轮只写入新增 replay 分片，并通过 manifest 原子更新清单。
 - 磁盘只保留最近窗口的分片，旧分片按清单安全清理。
-- 每轮固定随机训练 500 个 batch，耗时不再随 replay buffer 线性增长。
+- 默认只保留最近 20,000 条样本，不再让约 30 多轮的旧策略长期占据训练集。
+- 每轮训练有 50% 概率质量分配给最近 5,000 条样本，其余 50% 覆盖完整窗口。
+- 每轮固定训练 500 个 batch，耗时不再随 replay buffer 线性增长。
 - 与模型权重绑定的 LRU 缓存使用 Zobrist hash 复用重复局面的网络输出。
 
 在初始局面的实测样本中，紧凑格式从约 16.6 KB 降至约 1.6 KB；

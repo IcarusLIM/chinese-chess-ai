@@ -236,7 +236,17 @@ class PolicyValueNet(nn.Module):
         )
 
 
-def create_model(num_blocks: int = 10, channels: int = 256, device: str = 'cuda') -> PolicyValueNet:
+def get_default_device() -> str:
+    """选择当前机器上可用的最佳 PyTorch 设备。"""
+    if torch.cuda.is_available():
+        return 'cuda'
+    if torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
+def create_model(num_blocks: int = 10, channels: int = 256,
+                 device: str = None) -> PolicyValueNet:
     """
     创建并初始化策略-价值网络。
     
@@ -249,11 +259,12 @@ def create_model(num_blocks: int = 10, channels: int = 256, device: str = 'cuda'
             - 128: 轻量级，适合快速实验
             - 256: 标准配置
             - 384/512: 更强但需要更多显存
-        device: 计算设备 ('cuda' 或 'cpu')
+        device: 计算设备（None 时依次选择 CUDA、Apple MPS、CPU）
         
     Returns:
         初始化好的 PolicyValueNet 模型
     """
+    device = device or get_default_device()
     model = PolicyValueNet(num_blocks=num_blocks, channels=channels)
     
     # 移动到 GPU
@@ -266,7 +277,12 @@ def create_model(num_blocks: int = 10, channels: int = 256, device: str = 'cuda'
         # 使用 channels_last 内存格式（NVIDIA GPU 优化）
         model = model.to(memory_format=torch.channels_last)
         print(f"[模型] 已创建并移动到 CUDA 设备: {torch.cuda.get_device_name()}")
+    elif device == 'mps' and torch.backends.mps.is_available():
+        model = model.to('mps')
+        model = model.to(memory_format=torch.channels_last)
+        print("[模型] 已创建并移动到 Apple MPS 设备")
     else:
+        model = model.to('cpu')
         print("[模型] 已创建，使用 CPU 推理")
     
     print(model.get_model_info())
@@ -295,13 +311,13 @@ def create_model_from_checkpoint(path: str, device: str) -> PolicyValueNet:
 
 if __name__ == '__main__':
     # 测试：创建模型并进行一次前向传播
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = get_default_device()
     model = create_model(num_blocks=5, channels=128, device=device)
     
     # 模拟输入
     dummy_input = torch.randn(1, 15, BOARD_ROWS, BOARD_COLS)
-    if device == 'cuda':
-        dummy_input = dummy_input.cuda()
+    if device != 'cpu':
+        dummy_input = dummy_input.to(device)
     dummy_input = dummy_input.to(memory_format=torch.channels_last)
     
     policy, value = model(dummy_input)

@@ -24,10 +24,9 @@ import time
 import uuid
 import secrets
 import sqlite3
-import torch
 from flask import Flask, render_template, request, jsonify, session
 from game import Game
-from network import create_model, create_model_from_checkpoint
+from network import create_model, create_model_from_checkpoint, get_default_device
 from mcts import MCTSEvaluator
 from move_index import get_move_index
 from constants import PIECE_NAMES, PIECE_SYMBOLS, BOARD_ROWS, BOARD_COLS
@@ -179,7 +178,7 @@ def init_ai(model_path: str = None, num_simulations: int = 200,
     move_index = get_move_index()
     
     # 创建模型
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = get_default_device()
 
     if model_path:
         if not os.path.exists(model_path):

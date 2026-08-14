@@ -35,17 +35,20 @@ import time
 import random
 import copy
 import pickle
+import multiprocessing as mp
+import queue
+import traceback
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, RandomSampler
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from typing import List, Tuple, Dict
 from collections import deque
 
 from game import Game
-from network import PolicyValueNet, create_model, read_checkpoint
-from mcts import InferenceCache, MCTS, MCTSEvaluator
+from network import PolicyValueNet, create_model, get_default_device, read_checkpoint
+from mcts import InferenceCache, MCTS, MCTSEvaluator, search_many
 from move_index import get_move_index
 from constants import BOARD_ROWS, BOARD_COLS
 
@@ -91,6 +94,24 @@ class GameDataset(Dataset):
         )
 
 
+def build_replay_sample_weights(dataset_size: int, recent_window_size: int,
+                                recent_sample_fraction: float) -> torch.Tensor:
+    """构造分层采样权重，使近期窗口获得指定的总采样概率。"""
+    if dataset_size <= 0:
+        raise ValueError("dataset_size 必须大于 0")
+    if not 0.0 <= recent_sample_fraction <= 1.0:
+        raise ValueError("recent_sample_fraction 必须在 0 到 1 之间")
+    recent_count = min(max(1, recent_window_size), dataset_size)
+    old_count = dataset_size - recent_count
+    if old_count == 0:
+        return torch.ones(dataset_size, dtype=torch.double)
+
+    weights = torch.empty(dataset_size, dtype=torch.double)
+    weights[:old_count] = (1.0 - recent_sample_fraction) / old_count
+    weights[old_count:] = recent_sample_fraction / recent_count
+    return weights
+
+
 def compact_training_sample(board_tensor, policy, legal_mask, value) -> Tuple:
     """将自对弈样本压缩为适合长期 replay buffer 保存的格式。"""
     board = np.asarray(board_tensor, dtype=np.uint8)
@@ -119,7 +140,9 @@ class SelfPlayWorker:
                  inference_cache_size: int = 10000,
                  max_moves: int = 200,
                  temperature_threshold: int = 30,
-                 material_weight: float = 0.0):
+                 material_weight: float = 0.0,
+                 num_workers: int = 1,
+                 inference_server_batch_size: int = 256):
         """
         Args:
             model: 当前模型
@@ -129,6 +152,8 @@ class SelfPlayWorker:
             max_moves: 每局最大走子数（超过判和）
             temperature_threshold: 走子数超过此值后温度降为 0.01
             material_weight: MCTS 叶节点材料评估混合权重
+            num_workers: 自对弈 CPU actor 进程数；模型只保留在主进程
+            inference_server_batch_size: 集中式模型推理的最大合并 batch
         """
         self.model = model
         self.num_simulations = num_simulations
@@ -137,6 +162,10 @@ class SelfPlayWorker:
         self.max_moves = max_moves
         self.temperature_threshold = temperature_threshold
         self.material_weight = material_weight
+        self.num_workers = max(1, num_workers)
+        self.inference_server_batch_size = max(
+            self.inference_batch_size, inference_server_batch_size
+        )
         self.move_index = get_move_index()
         self.last_inference_calls = 0
         self.last_inference_positions = 0
@@ -229,18 +258,101 @@ class SelfPlayWorker:
         Returns:
             所有训练样本的列表
         """
-        all_data = []
+        if self.num_workers > 1 and num_games > 1:
+            return self._play_multiple_games_parallel(num_games)
+
         # 模型每轮训练后会更新，因此每轮自对弈前清空上一组权重的缓存。
         self.inference_cache.clear()
-        total_inference_calls = 0
-        total_inference_positions = 0
-        for i in range(num_games):
-            game_data = self.play_one_game()
-            all_data.extend(game_data)
-            total_inference_calls += self.last_inference_calls
-            total_inference_positions += self.last_inference_positions
-            if (i + 1) % 3 == 0:
-                print(f"  自对弈进度: {i+1}/{num_games}，累计样本数: {len(all_data)}")
+        if num_games <= 0:
+            return []
+
+        # 同时推进多盘棋，使一个 GPU batch 能包含不同棋局的叶节点。
+        slots = []
+        for _ in range(num_games):
+            slots.append({
+                'game': Game(),
+                'mcts': MCTS(
+                    self.model,
+                    num_simulations=self.num_simulations,
+                    add_root_noise=True,
+                    inference_batch_size=self.inference_batch_size,
+                    inference_cache=self.inference_cache,
+                    material_weight=self.material_weight,
+                ),
+                'states': [],
+                'policies': [],
+                'legal_masks': [],
+                'move_count': 0,
+                'finished': False,
+            })
+
+        completed = 0
+        next_progress = 3
+        while completed < num_games:
+            active_slots = [slot for slot in slots if not slot['finished']]
+            requests = []
+            for slot in active_slots:
+                temperature = (
+                    1.0 if slot['move_count'] < self.temperature_threshold else 0.01
+                )
+                requests.append((slot['mcts'], slot['game'], temperature))
+
+            search_results = search_many(
+                requests, inference_batch_size=self.inference_batch_size
+            )
+            for slot, (move_idx, policy) in zip(active_slots, search_results):
+                if move_idx < 0:
+                    slot['finished'] = True
+                    completed += 1
+                    continue
+
+                legal_mask = np.zeros(self.move_index.num_moves, dtype=np.bool_)
+                legal_mask[slot['mcts'].last_legal_indices] = True
+                slot['states'].append(slot['game'].get_board_tensor())
+                slot['policies'].append(policy)
+                slot['legal_masks'].append(legal_mask)
+
+                move = self.move_index.index_to_move(move_idx)
+                if move is None:
+                    slot['finished'] = True
+                    completed += 1
+                    continue
+                fr, fc, tr, tc = move
+                slot['game'].make_move((fr, fc), (tr, tc), validate=False)
+                slot['move_count'] += 1
+                if slot['move_count'] >= self.max_moves:
+                    slot['finished'] = True
+                    completed += 1
+
+            while completed >= next_progress:
+                sample_count = sum(len(slot['states']) for slot in slots)
+                print(
+                    f"  自对弈进度: {min(next_progress, num_games)}/{num_games}，"
+                    f"累计样本数: {sample_count}"
+                )
+                next_progress += 3
+
+        all_data = []
+        for slot in slots:
+            _, result = slot['game'].is_game_over()
+            if result == 'red_wins':
+                final_value = 1.0
+            elif result == 'black_wins':
+                final_value = -1.0
+            else:
+                final_value = 0.0
+            for index, (state, policy, legal_mask) in enumerate(zip(
+                slot['states'], slot['policies'], slot['legal_masks']
+            )):
+                value = final_value if index % 2 == 0 else -final_value
+                all_data.append(
+                    compact_training_sample(state, policy, legal_mask, value)
+                )
+
+        total_inference_calls = sum(slot['mcts'].inference_calls for slot in slots)
+        total_inference_positions = sum(
+            slot['mcts'].inference_positions for slot in slots
+        )
         average_batch = (
             total_inference_positions / total_inference_calls if total_inference_calls else 0.0
         )
@@ -253,6 +365,173 @@ class SelfPlayWorker:
             f"{self.inference_cache.misses} 未命中，当前 {len(self.inference_cache)} 项"
         )
         return all_data
+
+    def _play_multiple_games_parallel(self, num_games: int) -> List[Tuple]:
+        """多 CPU actor 生成搜索树，主进程集中执行神经网络推理。"""
+        worker_count = min(self.num_workers, num_games)
+        context = mp.get_context('spawn')
+        task_queue = context.Queue()
+        request_queue = context.Queue(maxsize=worker_count * 2)
+        result_queue = context.Queue()
+        response_queues = [context.Queue() for _ in range(worker_count)]
+
+        config = {
+            'num_simulations': self.num_simulations,
+            'inference_batch_size': self.inference_batch_size,
+            'inference_cache_size': self.inference_cache.max_size,
+            'max_moves': self.max_moves,
+            'temperature_threshold': self.temperature_threshold,
+            'material_weight': self.material_weight,
+        }
+        processes = []
+        for worker_id in range(worker_count):
+            process = context.Process(
+                target=_self_play_actor,
+                args=(
+                    worker_id, config, task_queue, request_queue,
+                    response_queues[worker_id], result_queue,
+                ),
+            )
+            process.start()
+            processes.append(process)
+
+        for game_id in range(num_games):
+            task_queue.put(game_id)
+        for _ in range(worker_count):
+            task_queue.put(None)
+
+        game_results = {}
+        done_workers = 0
+        inference_calls = 0
+        inference_positions = 0
+        cache_hits = cache_misses = cache_items = 0
+        try:
+            while len(game_results) < num_games or done_workers < worker_count:
+                requests = []
+                try:
+                    requests.append(request_queue.get(timeout=0.05))
+                    deadline = time.monotonic() + 0.002
+                    total_positions = len(requests[0][2])
+                    while total_positions < self.inference_server_batch_size:
+                        timeout = deadline - time.monotonic()
+                        if timeout <= 0:
+                            break
+                        try:
+                            item = request_queue.get(timeout=timeout)
+                        except queue.Empty:
+                            break
+                        requests.append(item)
+                        total_positions += len(item[2])
+                except queue.Empty:
+                    pass
+
+                if requests:
+                    combined_states = []
+                    slices = []
+                    for worker_id, request_id, states in requests:
+                        start = len(combined_states)
+                        combined_states.extend(states)
+                        slices.append((worker_id, request_id, start, len(states)))
+                    policies, values = self.model.predict_batch(combined_states)
+                    inference_calls += 1
+                    inference_positions += len(combined_states)
+                    for worker_id, request_id, start, length in slices:
+                        response_queues[worker_id].put((
+                            request_id,
+                            policies[start:start + length].astype(
+                                np.float16, copy=False
+                            ),
+                            values[start:start + length].astype(
+                                np.float16, copy=False
+                            ),
+                        ))
+
+                while True:
+                    try:
+                        message = result_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    kind = message[0]
+                    if kind == 'game':
+                        _, game_id, data = message
+                        game_results[game_id] = data
+                        completed = len(game_results)
+                        if completed % 3 == 0 or completed == num_games:
+                            sample_count = sum(len(item) for item in game_results.values())
+                            print(
+                                f"  自对弈进度: {completed}/{num_games}，"
+                                f"累计样本数: {sample_count}"
+                            )
+                    elif kind == 'done':
+                        _, _, hits, misses, items = message
+                        done_workers += 1
+                        cache_hits += hits
+                        cache_misses += misses
+                        cache_items += items
+                    elif kind == 'error':
+                        raise RuntimeError(
+                            f"自对弈 actor {message[1]} 异常:\n{message[2]}"
+                        )
+        finally:
+            for process in processes:
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.terminate()
+                    process.join()
+
+        average_batch = (
+            inference_positions / inference_calls if inference_calls else 0.0
+        )
+        print(
+            f"  集中式网络推理: {inference_calls} 批 / "
+            f"{inference_positions} 个局面，平均批大小: {average_batch:.1f}"
+        )
+        print(
+            f"  Actor 推理缓存: {cache_hits} 命中 / {cache_misses} 未命中，"
+            f"共 {cache_items} 项"
+        )
+        return [sample for game_id in range(num_games) for sample in game_results[game_id]]
+
+
+class _InferenceClientModel:
+    """自对弈 actor 中的模型代理；实际模型始终位于主进程/GPU。"""
+
+    def __init__(self, worker_id: int, request_queue, response_queue):
+        self.worker_id = worker_id
+        self.request_queue = request_queue
+        self.response_queue = response_queue
+        self.request_id = 0
+
+    def predict_batch(self, board_tensors):
+        request_id = self.request_id
+        self.request_id += 1
+        states = np.asarray(board_tensors, dtype=np.float32)
+        self.request_queue.put((self.worker_id, request_id, states))
+        response_id, policies, values = self.response_queue.get()
+        if response_id != request_id:
+            raise RuntimeError(
+                f"推理响应乱序: 期望 {request_id}，实际 {response_id}"
+            )
+        return policies, values
+
+
+def _self_play_actor(worker_id: int, config: dict, task_queue, request_queue,
+                     response_queue, result_queue):
+    """子进程入口：只执行 Python 棋局与树搜索，不持有 GPU 模型。"""
+    try:
+        proxy_model = _InferenceClientModel(worker_id, request_queue, response_queue)
+        worker = SelfPlayWorker(proxy_model, num_workers=1, **config)
+        while True:
+            game_id = task_queue.get()
+            if game_id is None:
+                break
+            result_queue.put(('game', game_id, worker.play_one_game()))
+        result_queue.put((
+            'done', worker_id, worker.inference_cache.hits,
+            worker.inference_cache.misses, len(worker.inference_cache),
+        ))
+    except Exception:
+        result_queue.put(('error', worker_id, traceback.format_exc()))
 
 
 class Trainer:
@@ -643,13 +922,17 @@ class TrainingPipeline:
                  num_simulations: int = 400,
                  inference_batch_size: int = 64,
                  inference_cache_size: int = 10000,
+                 self_play_workers: int = 4,
+                 inference_server_batch_size: int = 256,
                  eval_simulations: int = 200,
                  self_play_games: int = 25,
                  training_steps: int = 500,
                  batch_size: int = 256,
                  data_workers: int = 4,
                  learning_rate: float = 0.001,
-                 buffer_size: int = 100000,
+                 buffer_size: int = 20000,
+                 recent_window_size: int = 5000,
+                 recent_sample_fraction: float = 0.5,
                  evaluate_every: int = 2,
                  save_dir: str = 'models',
                  resume_from: str = None,
@@ -663,6 +946,8 @@ class TrainingPipeline:
             num_simulations: MCTS 模拟次数
             inference_batch_size: MCTS GPU 叶节点推理批大小
             inference_cache_size: 当前模型权重的 LRU 推理缓存容量
+            self_play_workers: 并行生成棋局的 CPU actor 进程数
+            inference_server_batch_size: 主进程集中式 GPU 推理最大 batch
             eval_simulations: 模型评估时每步 MCTS 模拟次数
             self_play_games: 每轮自对弈局数
             training_steps: 每轮从 replay buffer 随机采样的 batch 数
@@ -670,6 +955,8 @@ class TrainingPipeline:
             data_workers: 训练 DataLoader 工作进程数
             learning_rate: 初始学习率
             buffer_size: 经验回放缓冲区大小
+            recent_window_size: 分层采样时视为近期数据的末尾样本数
+            recent_sample_fraction: 每轮训练从近期数据抽取的目标比例
             evaluate_every: 每隔多少轮评估一次
             save_dir: 模型保存目录
             resume_from: 从指定 checkpoint 继续训练
@@ -682,14 +969,22 @@ class TrainingPipeline:
         self.num_simulations = num_simulations
         self.inference_batch_size = inference_batch_size
         self.inference_cache_size = max(0, inference_cache_size)
+        self.self_play_workers = max(1, self_play_workers)
+        self.inference_server_batch_size = max(
+            inference_batch_size, inference_server_batch_size
+        )
         self.eval_simulations = eval_simulations
         self.self_play_games = self_play_games
         self.training_steps = max(1, training_steps)
         self.batch_size = batch_size
         self.data_workers = max(0, data_workers)
         self.learning_rate = learning_rate
-        self.buffer_size = buffer_size
-        self.replay_window_size = max(1, buffer_size * 2 // 3)
+        self.buffer_size = max(1, buffer_size)
+        self.replay_window_size = self.buffer_size
+        self.recent_window_size = max(1, recent_window_size)
+        if not 0.0 <= recent_sample_fraction <= 1.0:
+            raise ValueError("recent_sample_fraction 必须在 0 到 1 之间")
+        self.recent_sample_fraction = recent_sample_fraction
         self.evaluate_every = evaluate_every
         self.save_dir = save_dir
         self.material_warmup = material_warmup
@@ -716,7 +1011,7 @@ class TrainingPipeline:
         os.makedirs(save_dir, exist_ok=True)
 
         # 初始化模型；续训时检查点中的网络结构是唯一数据源。
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = get_default_device()
         resume_checkpoint = None
         if resume_from:
             if not os.path.exists(resume_from):
@@ -771,6 +1066,8 @@ class TrainingPipeline:
             self.model, num_simulations=num_simulations,
             inference_batch_size=inference_batch_size,
             inference_cache_size=self.inference_cache_size,
+            num_workers=self.self_play_workers,
+            inference_server_batch_size=self.inference_server_batch_size,
         )
 
         # 评估器
@@ -874,11 +1171,18 @@ class TrainingPipeline:
         print(f"  模型: ResNet-{self.num_blocks}x{self.channels}")
         print(f"  MCTS 模拟次数: {self.num_simulations}")
         print(f"  MCTS 推理批大小: {self.inference_batch_size}")
+        print(f"  自对弈 CPU actors: {self.self_play_workers}")
+        print(f"  集中式推理最大 batch: {self.inference_server_batch_size}")
         print(f"  推理缓存容量: {self.inference_cache_size}")
         print(f"  评估 MCTS 模拟次数: {self.eval_simulations}")
         print(f"  每轮自对弈: {self.self_play_games} 局")
         print(f"  每轮训练 batch 数: {self.training_steps}")
         print(f"  训练批大小: {self.batch_size}")
+        print(f"  Replay 窗口: {self.replay_window_size} 条")
+        print(
+            f"  近期样本: 末尾 {self.recent_window_size} 条，"
+            f"训练占比 {self.recent_sample_fraction:.0%}"
+        )
         print(f"  数据加载进程: {self.data_workers}")
         print(f"  学习率: {self.learning_rate}")
         print(f"  总迭代次数: {num_iterations}")
@@ -923,10 +1227,14 @@ class TrainingPipeline:
             training_start = time.time()
             if len(self.replay_buffer) >= self.batch_size * 10:
                 dataset = GameDataset(list(self.replay_buffer))
-                sampler = RandomSampler(
-                    dataset,
-                    replacement=True,
+                sample_weights = build_replay_sample_weights(
+                    len(dataset), self.recent_window_size,
+                    self.recent_sample_fraction,
+                )
+                sampler = WeightedRandomSampler(
+                    sample_weights,
                     num_samples=self.training_steps * self.batch_size,
+                    replacement=True,
                 )
                 dataloader = DataLoader(
                     dataset, 

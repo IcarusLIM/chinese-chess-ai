@@ -38,12 +38,17 @@ def cmd_train(args):
         num_simulations=args.simulations,
         inference_batch_size=args.inference_batch_size,
         inference_cache_size=args.inference_cache_size,
+        self_play_workers=args.self_play_workers,
+        inference_server_batch_size=args.inference_server_batch_size,
         eval_simulations=args.eval_simulations,
         self_play_games=args.self_play_games,
         training_steps=args.training_steps,
         batch_size=args.batch_size,
         data_workers=args.data_workers,
         learning_rate=args.lr,
+        buffer_size=args.buffer_size,
+        recent_window_size=args.recent_window_size,
+        recent_sample_fraction=args.recent_sample_fraction,
         save_dir=args.save_dir,
         resume_from=args.resume,
         load_buffer=args.load_buffer,
@@ -78,10 +83,9 @@ def cmd_web(args):
 def cmd_play(args):
     """控制台对弈模式（调试用）"""
     from game import Game
-    from network import create_model, create_model_from_checkpoint
+    from network import create_model, create_model_from_checkpoint, get_default_device
     from mcts import MCTSEvaluator
     from move_index import get_move_index
-    import torch
     
     print("=" * 60)
     print("中国象棋 AI - 控制台对弈")
@@ -92,7 +96,7 @@ def cmd_play(args):
     print("=" * 60)
     
     # 初始化
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = get_default_device()
     if args.model:
         if not os.path.exists(args.model):
             raise FileNotFoundError(f"模型文件不存在: {args.model}")
@@ -181,12 +185,32 @@ def main():
         '--inference-cache-size', type=int, default=10000,
         help='当前模型权重的 LRU 局面缓存容量',
     )
+    train_parser.add_argument(
+        '--self-play-workers', type=int, default=4,
+        help='并行自对弈 CPU actor 进程数',
+    )
+    train_parser.add_argument(
+        '--inference-server-batch-size', type=int, default=256,
+        help='集中式 GPU 推理最大合并 batch',
+    )
     train_parser.add_argument('--eval-simulations', type=int, default=200, help='模型评估时每步 MCTS 模拟次数')
     train_parser.add_argument('--self-play-games', type=int, default=25, help='每轮自对弈局数')
     train_parser.add_argument('--training-steps', type=int, default=500, help='每轮随机训练 batch 数')
     train_parser.add_argument('--batch-size', type=int, default=256, help='训练批大小')
     train_parser.add_argument('--data-workers', type=int, default=4, help='训练数据加载进程数')
     train_parser.add_argument('--lr', type=float, default=0.001, help='学习率')
+    train_parser.add_argument(
+        '--buffer-size', type=int, default=20000,
+        help='Replay buffer 最近样本窗口大小',
+    )
+    train_parser.add_argument(
+        '--recent-window-size', type=int, default=5000,
+        help='分层采样中视为近期数据的末尾样本数',
+    )
+    train_parser.add_argument(
+        '--recent-sample-fraction', type=float, default=0.5,
+        help='每轮训练从近期数据采样的目标比例（0~1）',
+    )
     train_parser.add_argument('--save-dir', type=str, default='models', help='模型保存目录')
     train_parser.add_argument('--resume', type=str, default=None, help='从指定 checkpoint 继续训练')
     train_parser.add_argument(

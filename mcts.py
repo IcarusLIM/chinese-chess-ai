@@ -336,6 +336,139 @@ class MCTS:
 
         return best_move, policy
 
+    def prepare_search(self, game: Game, temperature: float = 1.0) -> dict:
+        """准备一次搜索，供多个棋局共享同一个神经网络推理批次。"""
+        if game.is_draw():
+            self.last_legal_indices = []
+            return {'finished': True, 'result': (-1, [0.0] * self.move_index.num_moves)}
+
+        reused_root = (
+            self._cached_root is not None and self._cached_root_hash == game.current_hash
+        )
+        root = self._cached_root if reused_root else MCTSNode()
+        legal_moves = game.get_legal_moves()
+        if not legal_moves:
+            self.last_legal_indices = []
+            return {'finished': True, 'result': (-1, [0.0] * self.move_index.num_moves)}
+
+        legal_indices = self._legal_indices(legal_moves)
+        self.last_legal_indices = legal_indices
+        if not legal_indices:
+            return {'finished': True, 'result': (-1, [0.0] * self.move_index.num_moves)}
+
+        return {
+            'finished': False,
+            'game': game,
+            'temperature': temperature,
+            'root': root,
+            'legal_indices': legal_indices,
+            'reused_root': reused_root,
+            'needs_root_evaluation': not root.is_expanded,
+        }
+
+    def finish_prepared_search(self, context: dict) -> Tuple[int, List[float]]:
+        """完成已执行模拟的搜索并缓存选中走法对应的子树。"""
+        root = context['root']
+        game = context['game']
+        temperature = context['temperature']
+        legal_indices = context['legal_indices']
+        policy = self._compute_policy(root, temperature)
+
+        if temperature <= 0.01:
+            best_move = max(root.N, key=lambda k: root.N[k])
+        else:
+            visits = np.array(
+                [root.N.get(i, 0) for i in legal_indices], dtype=np.float64
+            )
+            probs = self._temperature_probs(visits, temperature)
+            best_move = legal_indices[np.random.choice(len(legal_indices), p=probs)]
+
+        move = self.move_index.index_to_move(best_move)
+        if move is not None and best_move in root.children:
+            fr, fc, tr, tc = move
+            game.make_move((fr, fc), (tr, tc), validate=False)
+            self._cached_root = root.children[best_move]
+            self._cached_root_hash = game.current_hash
+            game.undo_move()
+        return best_move, policy
+
+    def select_leaf_for_batch(self, game: Game, root: MCTSNode,
+                              leaf_metadata: dict) -> dict:
+        """选择一个叶节点；调用方可汇总多个棋局后统一执行推理。"""
+        node = root
+        search_path = [(root, -1)]
+        virtual_edges = []
+
+        while node.is_expanded and node.children:
+            parent = node
+            move_idx, node = parent.select_child(
+                self.c_puct, sum(parent.N.values()) if parent.N else 0
+            )
+            parent.add_virtual_loss(move_idx, self.virtual_loss)
+            virtual_edges.append((parent, move_idx))
+            search_path.append((node, move_idx))
+
+            move = self.move_index.index_to_move(move_idx)
+            if move is None:
+                raise RuntimeError(f"MCTS 树中出现无效走法索引: {move_idx}")
+            fr, fc, tr, tc = move
+            game.make_move((fr, fc), (tr, tc), validate=False)
+
+        leaf_key = id(node)
+        metadata = leaf_metadata.get(leaf_key)
+        if metadata is None:
+            legal_moves = game.get_legal_moves()
+            legal_indices = self._legal_indices(legal_moves)
+            if not legal_indices:
+                metadata = {'legal_indices': legal_indices, 'value': -1.0}
+            elif game.is_draw():
+                metadata = {'legal_indices': legal_indices, 'value': 0.0}
+            else:
+                metadata = {
+                    'legal_indices': legal_indices,
+                    'value': None,
+                    'state': game.get_board_tensor(),
+                    'position_hash': game.current_hash,
+                    'material_value': (
+                        game.evaluate_material_normalized()
+                        if self.material_weight > 0 else 0.0
+                    ),
+                }
+            leaf_metadata[leaf_key] = metadata
+
+        for _ in range(len(search_path) - 1):
+            game.undo_move()
+
+        return {
+            'mcts': self,
+            'node': node,
+            'path': search_path,
+            'virtual_edges': virtual_edges,
+            'metadata': metadata,
+        }
+
+    def complete_leaf_record(self, record: dict):
+        """用集中推理的结果扩展一个叶节点并完成回传。"""
+        for parent, move_idx in record['virtual_edges']:
+            parent.revert_virtual_loss(move_idx, self.virtual_loss)
+
+        metadata = record['metadata']
+        if metadata['value'] is None:
+            network_value = metadata['network_value']
+            value = (
+                (1 - self.material_weight) * network_value
+                + self.material_weight * metadata['material_value']
+            )
+            record['node'].expand(
+                metadata['legal_indices'],
+                self._normalized_priors(
+                    metadata['policy_probs'], metadata['legal_indices']
+                ),
+            )
+        else:
+            value = metadata['value']
+        self._backup_path(record['path'], value)
+
     def _simulate_batch(self, game: Game, root: MCTSNode, batch_size: int):
         """选择一批叶节点，统一推理后分别扩展和回传。"""
         records = []
@@ -436,7 +569,7 @@ class MCTS:
         """批量查询 LRU，仅把未命中的局面提交给 GPU。"""
         policies = [None] * len(states)
         values = [None] * len(states)
-        miss_positions = []
+        miss_positions = {}
         miss_states = []
         miss_hashes = []
 
@@ -446,9 +579,12 @@ class MCTS:
                 if self.inference_cache is not None else None
             )
             if cached is None:
-                miss_positions.append(position)
-                miss_states.append(state)
-                miss_hashes.append(position_hash)
+                # 多盘棋可能到达相同局面，同一批内只推理一次。
+                if position_hash not in miss_positions:
+                    miss_positions[position_hash] = []
+                    miss_states.append(state)
+                    miss_hashes.append(position_hash)
+                miss_positions[position_hash].append(position)
             else:
                 cached_policy, cached_value = cached
                 policies[position] = np.asarray(cached_policy, dtype=np.float32)
@@ -458,13 +594,14 @@ class MCTS:
             miss_policies, miss_values = self.model.predict_batch(miss_states)
             self.inference_calls += 1
             self.inference_positions += len(miss_states)
-            for offset, position in enumerate(miss_positions):
+            for offset, position_hash in enumerate(miss_hashes):
                 policy = miss_policies[offset]
                 value = float(miss_values[offset])
-                policies[position] = policy
-                values[position] = value
+                for position in miss_positions[position_hash]:
+                    policies[position] = policy
+                    values[position] = value
                 if self.inference_cache is not None:
-                    self.inference_cache.put(miss_hashes[offset], policy, value)
+                    self.inference_cache.put(position_hash, policy, value)
 
         return np.asarray(policies, dtype=np.float32), np.asarray(values, dtype=np.float32)
 
@@ -540,6 +677,113 @@ class MCTS:
         weights = np.zeros(len(visits), dtype=np.float64)
         weights[positive] = np.exp(log_weights[positive])
         return weights / weights.sum()
+
+
+def search_many(requests: List[Tuple[MCTS, Game, float]],
+                inference_batch_size: int = 64) -> List[Tuple[int, List[float]]]:
+    """并行推进多棵 MCTS 树，把不同棋局的叶节点合并为 GPU batch。
+
+    这里的“并行”指搜索调度交错进行；规则生成仍在当前进程完成，但神经网络
+    不再为每盘棋分别等待一个小 batch。所有请求必须使用同一组模型权重。
+    """
+    if not requests:
+        return []
+    model = requests[0][0].model
+    if any(mcts.model is not model for mcts, _, _ in requests):
+        raise ValueError("search_many 的所有请求必须共享同一个模型实例")
+
+    contexts = []
+    results = [None] * len(requests)
+    for index, (mcts, game, temperature) in enumerate(requests):
+        context = mcts.prepare_search(game, temperature)
+        context['index'] = index
+        context['mcts'] = mcts
+        contexts.append(context)
+        if context['finished']:
+            results[index] = context['result']
+
+    active = [context for context in contexts if not context['finished']]
+    if not active:
+        return results
+
+    # 未扩展根节点也跨棋局集中推理。相同初始局面会在批内去重。
+    root_contexts = [c for c in active if c['needs_root_evaluation']]
+    if root_contexts:
+        predictor = root_contexts[0]['mcts']
+        policies, _ = predictor._predict_with_cache(
+            [c['game'].get_board_tensor() for c in root_contexts],
+            [c['game'].current_hash for c in root_contexts],
+        )
+        for context, policy in zip(root_contexts, policies):
+            context['root'].expand(
+                context['legal_indices'],
+                context['mcts']._normalized_priors(policy, context['legal_indices']),
+            )
+
+    for context in active:
+        mcts = context['mcts']
+        root = context['root']
+        legal_indices = context['legal_indices']
+        if mcts.add_root_noise:
+            noise = np.random.dirichlet([mcts.dirichlet_alpha] * len(legal_indices))
+            for move_idx, value in zip(legal_indices, noise):
+                root.P[move_idx] = (
+                    (1 - mcts.dirichlet_epsilon) * root.P.get(move_idx, 0.0)
+                    + mcts.dirichlet_epsilon * float(value)
+                )
+
+        existing_visits = sum(root.N.values()) if context['reused_root'] else 0
+        remaining = max(0, mcts.num_simulations - existing_visits)
+        if context['reused_root'] and mcts.add_root_noise:
+            remaining = max(
+                min(mcts.inference_batch_size, mcts.num_simulations), remaining
+            )
+        context['remaining'] = remaining
+        context['leaf_metadata'] = {}
+
+    batch_limit = max(1, inference_batch_size)
+    while any(context['remaining'] > 0 for context in active):
+        records = []
+        # Round-robin 选择，防止长棋局或高分支棋局独占一个 batch。
+        while len(records) < batch_limit:
+            added = False
+            for context in active:
+                if context['remaining'] <= 0:
+                    continue
+                records.append(context['mcts'].select_leaf_for_batch(
+                    context['game'], context['root'], context['leaf_metadata']
+                ))
+                context['remaining'] -= 1
+                added = True
+                if len(records) >= batch_limit:
+                    break
+            if not added:
+                break
+
+        unique_metadata = []
+        seen_metadata = set()
+        for record in records:
+            metadata = record['metadata']
+            if metadata['value'] is None and id(metadata) not in seen_metadata:
+                seen_metadata.add(id(metadata))
+                unique_metadata.append(metadata)
+
+        if unique_metadata:
+            predictor = records[0]['mcts']
+            policies, values = predictor._predict_with_cache(
+                [metadata['state'] for metadata in unique_metadata],
+                [metadata['position_hash'] for metadata in unique_metadata],
+            )
+            for metadata, policy, value in zip(unique_metadata, policies, values):
+                metadata['policy_probs'] = policy
+                metadata['network_value'] = float(value)
+
+        for record in records:
+            record['mcts'].complete_leaf_record(record)
+
+    for context in active:
+        results[context['index']] = context['mcts'].finish_prepared_search(context)
+    return results
 
 
 class MCTSEvaluator:
