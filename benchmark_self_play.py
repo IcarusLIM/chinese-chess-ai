@@ -18,6 +18,7 @@ def main():
     parser.add_argument('--blocks', type=int, default=1)
     parser.add_argument('--channels', type=int, default=32)
     parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--server-wait-ms', type=float, default=5.0)
     args = parser.parse_args()
 
     model = create_model(args.blocks, args.channels, device=get_default_device())
@@ -41,6 +42,7 @@ def main():
         model,
         num_workers=args.workers,
         inference_server_batch_size=args.batch_size * args.workers,
+        inference_server_wait_ms=args.server_wait_ms,
         **common,
     )
     start = time.perf_counter()

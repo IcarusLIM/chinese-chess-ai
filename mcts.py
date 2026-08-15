@@ -204,7 +204,9 @@ class MCTS:
                  inference_batch_size: int = 64,
                  virtual_loss: float = 1.0,
                  inference_cache: Optional[InferenceCache] = None,
-                 material_weight: float = 0.0):
+                 material_weight: float = 0.0,
+                 avoid_repetition: bool = True,
+                 repetition_material_threshold: float = -1.0):
         """
         Args:
             model: 策略-价值网络
@@ -223,6 +225,8 @@ class MCTS:
             virtual_loss: 批内选择时的临时损失，用于分散搜索路径
             inference_cache: 与当前模型权重绑定的共享推理缓存
             material_weight: 材料评估混合权重（0.0=纯网络，1.0=纯材料评估）
+            avoid_repetition: 有其他选择时避免主动走回历史局面
+            repetition_material_threshold: 启用重复规避的最低材料评估
         """
         if num_simulations < 1:
             raise ValueError("num_simulations 必须大于 0")
@@ -236,12 +240,15 @@ class MCTS:
         self.virtual_loss = virtual_loss
         self.inference_cache = inference_cache
         self.material_weight = material_weight
+        self.avoid_repetition = avoid_repetition
+        self.repetition_material_threshold = repetition_material_threshold
         self.move_index = get_move_index()
         self._cached_root: Optional[MCTSNode] = None
         self._cached_root_hash: Optional[int] = None
         self.last_legal_indices: List[int] = []
         self.inference_calls = 0
         self.inference_positions = 0
+        self.repetition_moves_avoided = 0
     
     def search(self, game: Game, temperature: float = 1.0) -> Tuple[int, List[float]]:
         """
@@ -259,7 +266,7 @@ class MCTS:
             - best_move_index: 选择的走法索引
             - policy: 长度为 num_moves 的概率分布
         """
-        if game.is_draw():
+        if game.get_adjudicated_result() is not None:
             self.last_legal_indices = []
             return -1, [0.0] * self.move_index.num_moves
 
@@ -311,19 +318,9 @@ class MCTS:
             self._simulate_batch(game, root, current_batch)
             simulations_remaining -= current_batch
         
-        # 根据访问次数计算策略分布
-        policy = self._compute_policy(root, temperature)
-        
-        # 选择走法
-        if temperature <= 0.01:
-            # 贪心：选择访问次数最多的
-            best_move = max(root.N, key=lambda k: root.N[k])
-        else:
-            # 按概率采样
-            visits = np.array([root.N.get(i, 0) for i in legal_indices], dtype=np.float64)
-            probs = self._temperature_probs(visits, temperature)
-            best_idx = np.random.choice(len(legal_indices), p=probs)
-            best_move = legal_indices[best_idx]
+        best_move, policy = self._select_root_move(
+            game, root, legal_indices, temperature
+        )
 
         # 记录选中子树及其预期哈希；调用方真正落子后下一次 search 会命中。
         move = self.move_index.index_to_move(best_move)
@@ -338,7 +335,7 @@ class MCTS:
 
     def prepare_search(self, game: Game, temperature: float = 1.0) -> dict:
         """准备一次搜索，供多个棋局共享同一个神经网络推理批次。"""
-        if game.is_draw():
+        if game.get_adjudicated_result() is not None:
             self.last_legal_indices = []
             return {'finished': True, 'result': (-1, [0.0] * self.move_index.num_moves)}
 
@@ -372,16 +369,9 @@ class MCTS:
         game = context['game']
         temperature = context['temperature']
         legal_indices = context['legal_indices']
-        policy = self._compute_policy(root, temperature)
-
-        if temperature <= 0.01:
-            best_move = max(root.N, key=lambda k: root.N[k])
-        else:
-            visits = np.array(
-                [root.N.get(i, 0) for i in legal_indices], dtype=np.float64
-            )
-            probs = self._temperature_probs(visits, temperature)
-            best_move = legal_indices[np.random.choice(len(legal_indices), p=probs)]
+        best_move, policy = self._select_root_move(
+            game, root, legal_indices, temperature
+        )
 
         move = self.move_index.index_to_move(best_move)
         if move is not None and best_move in root.children:
@@ -421,19 +411,24 @@ class MCTS:
             legal_indices = self._legal_indices(legal_moves)
             if not legal_indices:
                 metadata = {'legal_indices': legal_indices, 'value': -1.0}
-            elif game.is_draw():
-                metadata = {'legal_indices': legal_indices, 'value': 0.0}
             else:
-                metadata = {
-                    'legal_indices': legal_indices,
-                    'value': None,
-                    'state': game.get_board_tensor(),
-                    'position_hash': game.current_hash,
-                    'material_value': (
-                        game.evaluate_material_normalized()
-                        if self.material_weight > 0 else 0.0
-                    ),
-                }
+                terminal_result = game.get_adjudicated_result()
+                if terminal_result is not None:
+                    metadata = {
+                        'legal_indices': legal_indices,
+                        'value': self._result_value(game, terminal_result),
+                    }
+                else:
+                    metadata = {
+                        'legal_indices': legal_indices,
+                        'value': None,
+                        'state': game.get_board_tensor(),
+                        'position_hash': game.current_hash,
+                        'material_value': (
+                            game.evaluate_material_normalized()
+                            if self.material_weight > 0 else 0.0
+                        ),
+                    }
             leaf_metadata[leaf_key] = metadata
 
         for _ in range(len(search_path) - 1):
@@ -506,19 +501,21 @@ class MCTS:
                     value = -1.0
                     prediction_index = None
                     material_value = 0.0
-                elif game.is_draw():
-                    value = 0.0
-                    prediction_index = None
-                    material_value = 0.0
                 else:
-                    value = None
-                    prediction_index = len(pending_states)
-                    pending_states.append(game.get_board_tensor())
-                    pending_hashes.append(game.current_hash)
-                    material_value = (
-                        game.evaluate_material_normalized()
-                        if self.material_weight > 0 else 0.0
-                    )
+                    terminal_result = game.get_adjudicated_result()
+                    if terminal_result is not None:
+                        value = self._result_value(game, terminal_result)
+                        prediction_index = None
+                        material_value = 0.0
+                    else:
+                        value = None
+                        prediction_index = len(pending_states)
+                        pending_states.append(game.get_board_tensor())
+                        pending_hashes.append(game.current_hash)
+                        material_value = (
+                            game.evaluate_material_normalized()
+                            if self.material_weight > 0 else 0.0
+                        )
                 metadata = (legal_indices, value, prediction_index, material_value)
                 leaf_metadata[leaf_key] = metadata
             else:
@@ -615,6 +612,14 @@ class MCTS:
                 move_idx, value if (depth - i + 1) % 2 == 0 else -value
             )
 
+    @staticmethod
+    def _result_value(game: Game, result: str) -> float:
+        """将红黑胜负转换为当前走棋方视角的价值。"""
+        if result == 'draw':
+            return 0.0
+        red_won = result == 'red_wins'
+        return 1.0 if red_won == game.red_to_move else -1.0
+
     def _legal_indices(self, legal_moves: list) -> List[int]:
         indices = []
         for (fr, fc), (tr, tc) in legal_moves:
@@ -631,7 +636,53 @@ class MCTS:
             return [p / prior_sum for p in priors]
         return [1.0 / len(legal_indices)] * len(legal_indices)
     
-    def _compute_policy(self, root: MCTSNode, temperature: float) -> List[float]:
+    def _select_root_move(self, game: Game, root: MCTSNode,
+                          legal_indices: List[int], temperature: float):
+        """在实际落子前根据对局历史排除主动重复。"""
+        candidates = self._non_repeating_root_moves(game, legal_indices)
+        policy = self._compute_policy(root, temperature, candidates)
+        if temperature <= 0.01:
+            best_move = max(candidates, key=lambda move_idx: root.N.get(move_idx, 0))
+        else:
+            visits = np.array(
+                [root.N.get(move_idx, 0) for move_idx in candidates],
+                dtype=np.float64,
+            )
+            probabilities = self._temperature_probs(visits, temperature)
+            best_move = candidates[np.random.choice(len(candidates), p=probabilities)]
+        return best_move, policy
+
+    def _non_repeating_root_moves(self, game: Game,
+                                  legal_indices: List[int]) -> List[int]:
+        """返回不会立即回到历史局面的根走法。"""
+        if (
+            not self.avoid_repetition
+            or len(game.hash_history) < 2
+            or game.evaluate_material_normalized()
+            < self.repetition_material_threshold
+        ):
+            return legal_indices
+
+        historical_hashes = set(game.hash_history)
+        non_repeating = []
+        for move_idx in legal_indices:
+            move = self.move_index.index_to_move(move_idx)
+            if move is None:
+                continue
+            fr, fc, tr, tc = move
+            game.make_move((fr, fc), (tr, tc), validate=False)
+            repeats = game.current_hash in historical_hashes
+            game.undo_move()
+            if not repeats:
+                non_repeating.append(move_idx)
+
+        if non_repeating and len(non_repeating) < len(legal_indices):
+            self.repetition_moves_avoided += len(legal_indices) - len(non_repeating)
+            return non_repeating
+        return legal_indices
+
+    def _compute_policy(self, root: MCTSNode, temperature: float,
+                        move_indices: Optional[List[int]] = None) -> List[float]:
         """
         根据根节点的访问次数计算策略分布。
         
@@ -646,6 +697,13 @@ class MCTS:
         
         if not root.N:
             return policy
+
+        candidates = (
+            [move_idx for move_idx in move_indices if move_idx in root.N]
+            if move_indices is not None else list(root.N)
+        )
+        if not candidates:
+            return policy
         
         total_visits = sum(root.N.values())
         if total_visits == 0:
@@ -653,14 +711,13 @@ class MCTS:
         
         if temperature <= 0.01:
             # 贪心策略：只给最佳走法概率 1
-            best_move = max(root.N, key=lambda k: root.N[k])
+            best_move = max(candidates, key=lambda move_idx: root.N[move_idx])
             policy[best_move] = 1.0
         else:
             # 带温度的策略分布
-            move_indices = list(root.N)
-            visits = np.array([root.N[i] for i in move_indices], dtype=np.float64)
+            visits = np.array([root.N[i] for i in candidates], dtype=np.float64)
             probs = self._temperature_probs(visits, temperature)
-            for move_idx, probability in zip(move_indices, probs):
+            for move_idx, probability in zip(candidates, probs):
                 policy[move_idx] = float(probability)
         
         return policy

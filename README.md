@@ -198,7 +198,7 @@ python main.py play --model models/latest_model.pt
 - **飞将规则**：将帅不能面对面（同列中间无子）
 - **将死判定**：被将且无合法走法
 - **困毙判定**：未被将但无合法走法（中国象棋判负）
-- **和棋规则**：60回合无吃子 或 三次重复局面
+- **和棋规则**：60回合无吃子或三次重复局面；单方循环将军时将军方负
 
 ### 2. 神经网络 (`network.py`)
 
@@ -248,7 +248,7 @@ for 迭代 in range(100):
        （可选：材料评估 warmup 混合启发式评估）
     2. 训练：从经验回放缓冲区随机采样固定数量的 batch
     3. 评估：在固定多开局中交换红黑，候选模型 vs 当前基准模型成对对弈
-       - 计分率（胜=1、和=0.5、负=0）> 55% → 接受候选模型
+       - 计分率（胜=1、和=0.5、负=0）≥ 50% → 接受候选模型
        - 否则 → 回滚到上次通过的模型
     4. 保存：latest_model.pt + 本轮新增 replay 分片 + manifest
 ```
@@ -269,9 +269,11 @@ Loss = 策略损失(交叉熵) + 价值损失(MSE) + L2正则化
 | `num_simulations` | 400 | MCTS 模拟次数，越多越精确 |
 | `inference_batch_size` | 64 | 单次 GPU 推理合并的 MCTS 叶节点数 |
 | `inference_cache_size` | 10000 | 当前模型权重的 LRU 网络评估缓存容量 |
-| `self_play_workers` | 4 | 并行生成自对弈搜索树的 CPU actor 数量 |
+| `self_play_workers` | 0（自动） | 并行生成自对弈搜索树的 CPU actor 数量 |
 | `inference_server_batch_size` | 256 | 主进程集中式 GPU 推理最大 batch |
+| `inference_server_wait_ms` | 5 | 集中推理为合并 actor 请求等待的毫秒数 |
 | `eval_simulations` | 200 | 模型评估时每步 MCTS 模拟次数 |
+| `acceptance_threshold` | 0.50 | 候选模型最低计分率，达到即接受 |
 | `self_play_games` | 25 | 每轮自对弈局数 |
 | `training_steps` | 500 | 每轮从 replay 随机训练的 batch 数 |
 | `batch_size` | 256 | 训练批大小（RTX 5070 12GB 足够） |
@@ -280,6 +282,8 @@ Loss = 策略损失(交叉熵) + 价值损失(MSE) + L2正则化
 | `buffer_size` | 20000 | 只保留最近的 replay 样本窗口 |
 | `recent_window_size` | 5000 | 分层采样中定义为“近期”的末尾样本数 |
 | `recent_sample_fraction` | 0.5 | 每轮训练分配给近期窗口的采样概率 |
+| `draw_sample_fraction` | 0.5 | 和棋价值标签在训练采样中的目标概率 |
+| `material_adjudication_threshold` | 0.05 | 无进展/超时时按子力裁定胜负的最小差值（0=关闭） |
 | `c_puct` | 1.5 | MCTS 探索常数 |
 | `temperature` | 1.0→0.01 | 温度参数，训练时先高后低 |
 | `--resume` | — | 从指定 checkpoint 继续训练（恢复模型、优化器、迭代编号） |
@@ -288,14 +292,16 @@ Loss = 策略损失(交叉熵) + 价值损失(MSE) + L2正则化
 
 ## RTX 5070 训练建议
 
-自对弈默认启动 4 个 CPU actor。actor 并行完成规则生成和树遍历，主进程持有唯一模型，
+自对弈默认按逻辑核数自动启动 actor（预留 2 个逻辑核，且不超过本轮对局数）。
+actor 并行完成规则生成和树遍历，主进程持有唯一模型，
 将不同 actor 的叶节点请求合并成最多 256 个局面的 GPU batch，因此不会为每个进程复制
 CUDA 模型。单个 actor 内仍以最多 64 个叶节点为一批搜索并复用实际落子后的子树。
 同一组模型权重还会使用有界 LRU 缓存复用重复局面的原始网络输出。
 
 不同 CUDA/PyTorch 版本和棋局平均长度差异很大，因此不再给出未经实测的每轮耗时。
-训练日志会输出集中式推理的实际平均 batch。CPU 核数较多时可增加
-`--self-play-workers`；GPU 仍有余量时增加 `--inference-server-batch-size`。显存不足时优先
+训练日志会输出集中式推理的实际平均 batch 和各类终局数。
+可用 `--self-play-workers` 覆盖自动值；GPU 仍有余量时增加
+`--inference-server-batch-size` 或小幅增加 `--inference-server-wait-ms`。显存不足时优先
 降低集中式 batch，再降低 `--inference-batch-size`。可用下面的命令先做本机对照：
 
 ```bash
@@ -317,7 +323,11 @@ CUDA 模型。单个 actor 内仍以最多 64 个叶节点为一批搜索并复�
 - 磁盘只保留最近窗口的分片，旧分片按清单安全清理。
 - 默认只保留最近 20,000 条样本，不再让约 30 多轮的旧策略长期占据训练集。
 - 每轮训练有 50% 概率质量分配给最近 5,000 条样本，其余 50% 覆盖完整窗口。
+- 和棋标签默认限制为 50% 的训练采样概率，避免价值头被大量零标签淹没。
+- MCTS 实际落子时会排除返回历史局面的走法（除非没有其他合法选择），并同步修正策略标签。
+- 60 回合无进展或达到 200 步上限时，子力差达到 5% 才裁定领先方胜，否则仍保留和棋。
 - 每轮固定训练 500 个 batch，耗时不再随 replay buffer 线性增长。
+- AMP 梯度溢出时会安全跳过当前 batch 并自动降低 scale；策略损失始终以 FP32 计算。
 - 与模型权重绑定的 LRU 缓存使用 Zobrist hash 复用重复局面的网络输出。
 
 在初始局面的实测样本中，紧凑格式从约 16.6 KB 降至约 1.6 KB；

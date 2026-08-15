@@ -4,3 +4,4 @@
 *.pt
 *.pkl
 instance/
+models

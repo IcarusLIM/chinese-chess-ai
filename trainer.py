@@ -14,7 +14,7 @@
   3. 评估候选模型
      - 候选模型 vs 当前基准模型对弈
      - 固定多开局、交换红黑进行成对评估
-     - 计分率（胜=1、和=0.5、负=0）> 55% 则接受新模型
+     - 计分率（胜=1、和=0.5、负=0）不低于 50% 则接受新模型
   4. 重复
 
 关键超参数：
@@ -43,7 +43,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from collections import deque
 
 from game import Game
@@ -51,6 +51,62 @@ from network import PolicyValueNet, create_model, get_default_device, read_check
 from mcts import InferenceCache, MCTS, MCTSEvaluator, search_many
 from move_index import get_move_index
 from constants import BOARD_ROWS, BOARD_COLS
+
+
+def resolve_self_play_workers(requested: int, num_games: int) -> int:
+    """解析 actor 数量；0 表示按逻辑核自动预留 2 个核。"""
+    if requested > 0:
+        return min(requested, max(1, num_games))
+    logical_cpus = os.cpu_count() or 1
+    return min(max(1, num_games), max(1, logical_cpus - 2))
+
+
+def game_outcome(game: Game, hit_move_limit: bool = False,
+                 material_adjudication_threshold: float = None) -> Tuple[str, str]:
+    """返回对局结果和可用于日志的终局原因。"""
+    is_over, result = game.is_game_over()
+    if is_over:
+        if result == 'draw':
+            reason = game.get_draw_reason() or 'draw'
+            if (
+                reason == 'no_progress'
+                and material_adjudication_threshold is not None
+                and material_adjudication_threshold > 0
+            ):
+                material_result = adjudicate_material(
+                    game, material_adjudication_threshold
+                )
+                if material_result is not None:
+                    return material_result, 'material_adjudication'
+            return result, reason
+        if game.get_repetition_result() == result:
+            return result, 'perpetual_check'
+        return result, 'decisive'
+    if hit_move_limit:
+        if (
+            material_adjudication_threshold is not None
+            and material_adjudication_threshold > 0
+        ):
+            material_result = adjudicate_material(
+                game, material_adjudication_threshold
+            )
+            if material_result is not None:
+                return material_result, 'material_adjudication'
+        return 'draw', 'max_moves'
+    return 'draw', 'incomplete'
+
+
+def adjudicate_material(game: Game, threshold: float) -> Optional[str]:
+    """以红方视角的子力差裁定超时/无进展对局。"""
+    current_side_balance = game.evaluate_material_normalized()
+    red_balance = (
+        current_side_balance if game.red_to_move else -current_side_balance
+    )
+    if red_balance >= threshold:
+        return 'red_wins'
+    if red_balance <= -threshold:
+        return 'black_wins'
+    return None
 
 
 class GameDataset(Dataset):
@@ -94,21 +150,54 @@ class GameDataset(Dataset):
         )
 
 
-def build_replay_sample_weights(dataset_size: int, recent_window_size: int,
-                                recent_sample_fraction: float) -> torch.Tensor:
-    """构造分层采样权重，使近期窗口获得指定的总采样概率。"""
+def build_replay_sample_weights(
+        dataset_size: int, recent_window_size: int,
+        recent_sample_fraction: float, sample_values=None,
+        draw_sample_fraction: float = None) -> torch.Tensor:
+    """构造近期分层权重，并可限制和棋标签的总采样概率。"""
     if dataset_size <= 0:
         raise ValueError("dataset_size 必须大于 0")
     if not 0.0 <= recent_sample_fraction <= 1.0:
         raise ValueError("recent_sample_fraction 必须在 0 到 1 之间")
+    if draw_sample_fraction is not None and not 0.0 <= draw_sample_fraction <= 1.0:
+        raise ValueError("draw_sample_fraction 必须在 0 到 1 之间")
     recent_count = min(max(1, recent_window_size), dataset_size)
     old_count = dataset_size - recent_count
-    if old_count == 0:
-        return torch.ones(dataset_size, dtype=torch.double)
+    weights = torch.ones(dataset_size, dtype=torch.double)
+    if old_count > 0:
+        weights[:old_count] = (1.0 - recent_sample_fraction) / old_count
+        weights[old_count:] = recent_sample_fraction / recent_count
 
-    weights = torch.empty(dataset_size, dtype=torch.double)
-    weights[:old_count] = (1.0 - recent_sample_fraction) / old_count
-    weights[old_count:] = recent_sample_fraction / recent_count
+    if sample_values is not None and draw_sample_fraction is not None:
+        values = torch.as_tensor(sample_values)
+        if values.numel() != dataset_size:
+            raise ValueError("sample_values 长度必须等于 dataset_size")
+        draw_mask = values == 0
+        decisive_mask = ~draw_mask
+        if draw_mask.any() and decisive_mask.any():
+            recent_mask = torch.zeros(dataset_size, dtype=torch.bool)
+            recent_mask[old_count:] = True
+            old_mask = ~recent_mask
+            groups = (
+                (old_mask & draw_mask,
+                 (1.0 - recent_sample_fraction) * draw_sample_fraction),
+                (old_mask & decisive_mask,
+                 (1.0 - recent_sample_fraction) * (1.0 - draw_sample_fraction)),
+                (recent_mask & draw_mask,
+                 recent_sample_fraction * draw_sample_fraction),
+                (recent_mask & decisive_mask,
+                 recent_sample_fraction * (1.0 - draw_sample_fraction)),
+            )
+            if old_count > 0 and all(mask.any() for mask, _ in groups):
+                for mask, probability_mass in groups:
+                    weights[mask] = probability_mass / int(mask.sum())
+            else:
+                draw_mass = weights[draw_mask].sum()
+                decisive_mass = weights[decisive_mask].sum()
+                weights[draw_mask] *= draw_sample_fraction / draw_mass
+                weights[decisive_mask] *= (
+                    (1.0 - draw_sample_fraction) / decisive_mass
+                )
     return weights
 
 
@@ -142,7 +231,9 @@ class SelfPlayWorker:
                  temperature_threshold: int = 30,
                  material_weight: float = 0.0,
                  num_workers: int = 1,
-                 inference_server_batch_size: int = 256):
+                 inference_server_batch_size: int = 256,
+                 inference_server_wait_ms: float = 5.0,
+                 material_adjudication_threshold: float = 0.05):
         """
         Args:
             model: 当前模型
@@ -154,6 +245,7 @@ class SelfPlayWorker:
             material_weight: MCTS 叶节点材料评估混合权重
             num_workers: 自对弈 CPU actor 进程数；模型只保留在主进程
             inference_server_batch_size: 集中式模型推理的最大合并 batch
+            inference_server_wait_ms: 首个请求后等待其他 actor 合批的毫秒数
         """
         self.model = model
         self.num_simulations = num_simulations
@@ -166,9 +258,15 @@ class SelfPlayWorker:
         self.inference_server_batch_size = max(
             self.inference_batch_size, inference_server_batch_size
         )
+        self.inference_server_wait_ms = max(0.0, inference_server_wait_ms)
+        self.material_adjudication_threshold = max(
+            0.0, material_adjudication_threshold
+        )
         self.move_index = get_move_index()
         self.last_inference_calls = 0
         self.last_inference_positions = 0
+        self.last_game_summary = None
+        self.last_repetition_moves_avoided = 0
     
     def play_one_game(self) -> List[Tuple]:
         """
@@ -223,7 +321,10 @@ class SelfPlayWorker:
             move_count += 1
         
         # 确定游戏结果
-        is_over, result = game.is_game_over()
+        result, reason = game_outcome(
+            game, move_count >= self.max_moves,
+            self.material_adjudication_threshold,
+        )
         if result == 'red_wins':
             final_value = 1.0
         elif result == 'black_wins':
@@ -246,6 +347,8 @@ class SelfPlayWorker:
 
         self.last_inference_calls = mcts.inference_calls
         self.last_inference_positions = mcts.inference_positions
+        self.last_game_summary = (result, reason, move_count)
+        self.last_repetition_moves_avoided = mcts.repetition_moves_avoided
         return training_data
     
     def play_multiple_games(self, num_games: int) -> List[Tuple]:
@@ -333,8 +436,13 @@ class SelfPlayWorker:
                 next_progress += 3
 
         all_data = []
+        termination_counts = {}
         for slot in slots:
-            _, result = slot['game'].is_game_over()
+            result, reason = game_outcome(
+                slot['game'], slot['move_count'] >= self.max_moves,
+                self.material_adjudication_threshold,
+            )
+            termination_counts[reason] = termination_counts.get(reason, 0) + 1
             if result == 'red_wins':
                 final_value = 1.0
             elif result == 'black_wins':
@@ -364,6 +472,11 @@ class SelfPlayWorker:
             f"  推理缓存: {self.inference_cache.hits} 命中 / "
             f"{self.inference_cache.misses} 未命中，当前 {len(self.inference_cache)} 项"
         )
+        print(f"  终局统计: {termination_counts}")
+        print(
+            "  根节点重复走法规避: "
+            f"{sum(slot['mcts'].repetition_moves_avoided for slot in slots)} 次"
+        )
         return all_data
 
     def _play_multiple_games_parallel(self, num_games: int) -> List[Tuple]:
@@ -382,6 +495,7 @@ class SelfPlayWorker:
             'max_moves': self.max_moves,
             'temperature_threshold': self.temperature_threshold,
             'material_weight': self.material_weight,
+            'material_adjudication_threshold': self.material_adjudication_threshold,
         }
         processes = []
         for worker_id in range(worker_count):
@@ -401,16 +515,20 @@ class SelfPlayWorker:
             task_queue.put(None)
 
         game_results = {}
+        game_summaries = {}
         done_workers = 0
         inference_calls = 0
         inference_positions = 0
         cache_hits = cache_misses = cache_items = 0
+        repetition_moves_avoided = 0
         try:
             while len(game_results) < num_games or done_workers < worker_count:
                 requests = []
                 try:
                     requests.append(request_queue.get(timeout=0.05))
-                    deadline = time.monotonic() + 0.002
+                    deadline = (
+                        time.monotonic() + self.inference_server_wait_ms / 1000.0
+                    )
                     total_positions = len(requests[0][2])
                     while total_positions < self.inference_server_batch_size:
                         timeout = deadline - time.monotonic()
@@ -426,12 +544,15 @@ class SelfPlayWorker:
                     pass
 
                 if requests:
-                    combined_states = []
+                    state_batches = []
                     slices = []
+                    combined_size = 0
                     for worker_id, request_id, states in requests:
-                        start = len(combined_states)
-                        combined_states.extend(states)
+                        start = combined_size
+                        state_batches.append(states)
+                        combined_size += len(states)
                         slices.append((worker_id, request_id, start, len(states)))
+                    combined_states = np.concatenate(state_batches, axis=0)
                     policies, values = self.model.predict_batch(combined_states)
                     inference_calls += 1
                     inference_positions += len(combined_states)
@@ -453,8 +574,9 @@ class SelfPlayWorker:
                         break
                     kind = message[0]
                     if kind == 'game':
-                        _, game_id, data = message
+                        _, game_id, data, summary = message
                         game_results[game_id] = data
+                        game_summaries[game_id] = summary
                         completed = len(game_results)
                         if completed % 3 == 0 or completed == num_games:
                             sample_count = sum(len(item) for item in game_results.values())
@@ -463,11 +585,12 @@ class SelfPlayWorker:
                                 f"累计样本数: {sample_count}"
                             )
                     elif kind == 'done':
-                        _, _, hits, misses, items = message
+                        _, _, hits, misses, items, avoided = message
                         done_workers += 1
                         cache_hits += hits
                         cache_misses += misses
                         cache_items += items
+                        repetition_moves_avoided += avoided
                     elif kind == 'error':
                         raise RuntimeError(
                             f"自对弈 actor {message[1]} 异常:\n{message[2]}"
@@ -490,6 +613,11 @@ class SelfPlayWorker:
             f"  Actor 推理缓存: {cache_hits} 命中 / {cache_misses} 未命中，"
             f"共 {cache_items} 项"
         )
+        termination_counts = {}
+        for _, reason, _ in game_summaries.values():
+            termination_counts[reason] = termination_counts.get(reason, 0) + 1
+        print(f"  终局统计: {termination_counts}")
+        print(f"  根节点重复走法规避: {repetition_moves_avoided} 次")
         return [sample for game_id in range(num_games) for sample in game_results[game_id]]
 
 
@@ -521,14 +649,18 @@ def _self_play_actor(worker_id: int, config: dict, task_queue, request_queue,
     try:
         proxy_model = _InferenceClientModel(worker_id, request_queue, response_queue)
         worker = SelfPlayWorker(proxy_model, num_workers=1, **config)
+        repetition_moves_avoided = 0
         while True:
             game_id = task_queue.get()
             if game_id is None:
                 break
-            result_queue.put(('game', game_id, worker.play_one_game()))
+            data = worker.play_one_game()
+            repetition_moves_avoided += worker.last_repetition_moves_avoided
+            result_queue.put(('game', game_id, data, worker.last_game_summary))
         result_queue.put((
             'done', worker_id, worker.inference_cache.hits,
             worker.inference_cache.misses, len(worker.inference_cache),
+            repetition_moves_avoided,
         ))
     except Exception:
         result_queue.put(('error', worker_id, traceback.format_exc()))
@@ -600,6 +732,8 @@ class Trainer:
         total_policy_loss = 0.0
         total_value_loss = 0.0
         num_batches = 0
+        skipped_batches = 0
+        consecutive_overflows = 0
 
         device = next(self.model.parameters()).device
         for states, target_policies, legal_masks, target_values in dataloader:
@@ -624,8 +758,10 @@ class Trainer:
                 effective_masks = torch.where(
                     valid_rows, legal_masks, torch.ones_like(legal_masks)
                 )
-                masked_logits = policy_logits.masked_fill(
-                    ~effective_masks, torch.finfo(policy_logits.dtype).min
+                # softmax/交叉熵固定使用 FP32。大动作空间下 FP16 的极端
+                # logits 虽可能得到有限 loss，反向梯度仍更容易溢出。
+                masked_logits = policy_logits.float().masked_fill(
+                    ~effective_masks, -1e9
                 )
 
                 policy_loss = -torch.mean(
@@ -633,7 +769,9 @@ class Trainer:
                 )
 
                 # 价值损失：均方误差
-                value_loss = F.mse_loss(value_pred.squeeze(-1), target_values)
+                value_loss = F.mse_loss(
+                    value_pred.squeeze(-1).float(), target_values.float()
+                )
 
                 # 总损失
                 loss = policy_loss + value_loss
@@ -648,11 +786,40 @@ class Trainer:
             if self.use_amp:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 1.0, error_if_nonfinite=True
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 1.0, error_if_nonfinite=False
                 )
+                if not torch.isfinite(grad_norm):
+                    # total norm 溢出不一定意味着 unscale_ 已发现单个 Inf，
+                    # 因此这里明确不调用 optimizer.step，并主动降低 scale。
+                    # 旧实现直接抛异常，GradScaler 没有机会恢复。
+                    scale_before = self.scaler.get_scale()
+                    self.scaler.update(new_scale=max(
+                        1.0,
+                        scale_before * self.scaler.get_backoff_factor(),
+                    ))
+                    self.optimizer.zero_grad(set_to_none=True)
+                    skipped_batches += 1
+                    consecutive_overflows += 1
+                    if (
+                        skipped_batches <= 3
+                        or (skipped_batches & (skipped_batches - 1)) == 0
+                    ):
+                        print(
+                            f"  [AMP] 第 {num_batches + skipped_batches} 个 batch "
+                            f"梯度溢出，已跳过；scale {scale_before:.0f} -> "
+                            f"{self.scaler.get_scale():.0f}"
+                        )
+                    if consecutive_overflows >= 8:
+                        raise FloatingPointError(
+                            "连续 8 个 batch 梯度溢出；已停止训练以保护模型。"
+                            f"当前 AMP scale={self.scaler.get_scale():.0f}，"
+                            f"学习率={self.optimizer.param_groups[0]['lr']:.3g}"
+                        )
+                    continue
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                consecutive_overflows = 0
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
@@ -666,6 +833,9 @@ class Trainer:
             total_value_loss += value_loss.item()
             num_batches += 1
         
+        if num_batches == 0:
+            raise FloatingPointError("本轮没有任何成功的参数更新，拒绝推进学习率")
+
         # 更新学习率
         self.scheduler.step()
         
@@ -680,6 +850,9 @@ class Trainer:
             'policy_loss': avg_policy_loss,
             'value_loss': avg_value_loss,
             'lr': self.scheduler.get_last_lr()[0],
+            'successful_batches': num_batches,
+            'skipped_batches': skipped_batches,
+            'amp_scale': self.scaler.get_scale() if self.use_amp else 1.0,
         }
         
         self.training_history.append(metrics)
@@ -761,7 +934,8 @@ class ModelEvaluator:
     def __init__(self, num_games: int = 20, num_simulations: int = 200,
                  inference_batch_size: int = 64,
                  inference_cache_size: int = 10000,
-                 acceptance_threshold: float = 0.55, opening_seed: int = 20240814):
+                 acceptance_threshold: float = 0.50, opening_seed: int = 20240814,
+                 material_adjudication_threshold: float = 0.05):
         """
         Args:
             num_games: 评估对弈局数
@@ -773,12 +947,17 @@ class ModelEvaluator:
         """
         if num_games < 2 or num_games % 2 != 0:
             raise ValueError("num_games 必须是大于等于 2 的偶数，以便交换红黑成对评估")
+        if not 0.0 <= acceptance_threshold <= 1.0:
+            raise ValueError("acceptance_threshold 必须在 0 到 1 之间")
         self.num_games = num_games
         self.num_simulations = num_simulations
         self.inference_batch_size = inference_batch_size
         self.inference_cache_size = inference_cache_size
         self.acceptance_threshold = acceptance_threshold
         self.opening_seed = opening_seed
+        self.material_adjudication_threshold = max(
+            0.0, material_adjudication_threshold
+        )
         self.move_index = get_move_index()
     
     def evaluate(self, candidate_model: PolicyValueNet,
@@ -796,6 +975,8 @@ class ModelEvaluator:
         candidate_wins = 0
         reference_wins = 0
         draws = 0
+        termination_counts = {}
+        repetition_moves_avoided = 0
         candidate_cache = InferenceCache(self.inference_cache_size)
         reference_cache = InferenceCache(self.inference_cache_size)
         
@@ -811,9 +992,11 @@ class ModelEvaluator:
                 red_cache, black_cache = reference_cache, candidate_cache
                 candidate_is_red = False
             
-            result = self._play_evaluation_game(
+            result, reason, avoided = self._play_evaluation_game(
                 red_model, black_model, opening_game, red_cache, black_cache
             )
+            repetition_moves_avoided += avoided
+            termination_counts[reason] = termination_counts.get(reason, 0) + 1
             
             if result == 'red_wins':
                 if candidate_is_red:
@@ -841,14 +1024,16 @@ class ModelEvaluator:
             'draws': draws,
             'win_rate': win_rate,
             'score_rate': score_rate,
-            'accepted': score_rate > self.acceptance_threshold,
+            'accepted': score_rate >= self.acceptance_threshold,
+            'termination_counts': termination_counts,
+            'repetition_moves_avoided': repetition_moves_avoided,
         }
 
     def _create_opening(self, opening_index: int) -> Game:
         """生成固定、可复现的非终局开局；每个开局保持红方走棋。"""
         game = Game()
         rng = random.Random(self.opening_seed + opening_index)
-        opening_plies = 4 + 2 * (opening_index % 4)
+        opening_plies = 8 + 4 * (opening_index % 5)
         for _ in range(opening_plies):
             legal_moves = game.get_legal_moves()
             if not legal_moves:
@@ -872,7 +1057,7 @@ class ModelEvaluator:
                               black_model: PolicyValueNet,
                               opening_game: Game = None,
                               red_cache: InferenceCache = None,
-                              black_cache: InferenceCache = None) -> str:
+                              black_cache: InferenceCache = None) -> Tuple[str, str, int]:
         """执行一局评估对弈"""
         game = opening_game.copy() if opening_game is not None else Game()
         red_mcts = MCTS(
@@ -893,20 +1078,48 @@ class ModelEvaluator:
                 move_idx, _ = black_mcts.search(game, temperature=0.01)
             
             if move_idx < 0:
-                return 'draw'
+                result, reason = game_outcome(
+                    game,
+                    material_adjudication_threshold=(
+                        self.material_adjudication_threshold
+                    ),
+                )
+                return (
+                    result, reason,
+                    red_mcts.repetition_moves_avoided
+                    + black_mcts.repetition_moves_avoided,
+                )
             
             move = self.move_index.index_to_move(move_idx)
             if move is None:
-                return 'draw'
+                return 'draw', 'invalid_move', 0
             
             fr, fc, tr, tc = move
             game.make_move((fr, fc), (tr, tc), validate=False)
             
             is_over, result = game.is_game_over()
             if is_over:
-                return result
+                result, reason = game_outcome(
+                    game,
+                    material_adjudication_threshold=(
+                        self.material_adjudication_threshold
+                    ),
+                )
+                return (
+                    result, reason,
+                    red_mcts.repetition_moves_avoided
+                    + black_mcts.repetition_moves_avoided,
+                )
         
-        return 'draw'
+        result, reason = game_outcome(
+            game, hit_move_limit=True,
+            material_adjudication_threshold=self.material_adjudication_threshold,
+        )
+        return (
+            result, reason,
+            red_mcts.repetition_moves_avoided
+            + black_mcts.repetition_moves_avoided,
+        )
 
 
 class TrainingPipeline:
@@ -922,8 +1135,9 @@ class TrainingPipeline:
                  num_simulations: int = 400,
                  inference_batch_size: int = 64,
                  inference_cache_size: int = 10000,
-                 self_play_workers: int = 4,
+                 self_play_workers: int = 0,
                  inference_server_batch_size: int = 256,
+                 inference_server_wait_ms: float = 5.0,
                  eval_simulations: int = 200,
                  self_play_games: int = 25,
                  training_steps: int = 500,
@@ -933,7 +1147,10 @@ class TrainingPipeline:
                  buffer_size: int = 20000,
                  recent_window_size: int = 5000,
                  recent_sample_fraction: float = 0.5,
+                 draw_sample_fraction: float = 0.5,
+                 material_adjudication_threshold: float = 0.05,
                  evaluate_every: int = 2,
+                 acceptance_threshold: float = 0.50,
                  save_dir: str = 'models',
                  resume_from: str = None,
                  load_buffer: str = None,
@@ -948,6 +1165,7 @@ class TrainingPipeline:
             inference_cache_size: 当前模型权重的 LRU 推理缓存容量
             self_play_workers: 并行生成棋局的 CPU actor 进程数
             inference_server_batch_size: 主进程集中式 GPU 推理最大 batch
+            inference_server_wait_ms: 集中推理合批等待时间（毫秒）
             eval_simulations: 模型评估时每步 MCTS 模拟次数
             self_play_games: 每轮自对弈局数
             training_steps: 每轮从 replay buffer 随机采样的 batch 数
@@ -957,7 +1175,10 @@ class TrainingPipeline:
             buffer_size: 经验回放缓冲区大小
             recent_window_size: 分层采样时视为近期数据的末尾样本数
             recent_sample_fraction: 每轮训练从近期数据抽取的目标比例
+            draw_sample_fraction: 和棋标签在训练采样中的目标概率
+            material_adjudication_threshold: 无进展/超时对局的子力裁定阈值
             evaluate_every: 每隔多少轮评估一次
+            acceptance_threshold: 候选模型接受的最低计分率
             save_dir: 模型保存目录
             resume_from: 从指定 checkpoint 继续训练
             load_buffer: 从 replay 目录或 manifest 加载数据
@@ -969,10 +1190,13 @@ class TrainingPipeline:
         self.num_simulations = num_simulations
         self.inference_batch_size = inference_batch_size
         self.inference_cache_size = max(0, inference_cache_size)
-        self.self_play_workers = max(1, self_play_workers)
+        self.self_play_workers = resolve_self_play_workers(
+            self_play_workers, self_play_games
+        )
         self.inference_server_batch_size = max(
             inference_batch_size, inference_server_batch_size
         )
+        self.inference_server_wait_ms = max(0.0, inference_server_wait_ms)
         self.eval_simulations = eval_simulations
         self.self_play_games = self_play_games
         self.training_steps = max(1, training_steps)
@@ -985,6 +1209,12 @@ class TrainingPipeline:
         if not 0.0 <= recent_sample_fraction <= 1.0:
             raise ValueError("recent_sample_fraction 必须在 0 到 1 之间")
         self.recent_sample_fraction = recent_sample_fraction
+        if not 0.0 <= draw_sample_fraction <= 1.0:
+            raise ValueError("draw_sample_fraction 必须在 0 到 1 之间")
+        self.draw_sample_fraction = draw_sample_fraction
+        self.material_adjudication_threshold = max(
+            0.0, material_adjudication_threshold
+        )
         self.evaluate_every = evaluate_every
         self.save_dir = save_dir
         self.material_warmup = material_warmup
@@ -1068,6 +1298,10 @@ class TrainingPipeline:
             inference_cache_size=self.inference_cache_size,
             num_workers=self.self_play_workers,
             inference_server_batch_size=self.inference_server_batch_size,
+            inference_server_wait_ms=self.inference_server_wait_ms,
+            material_adjudication_threshold=(
+                self.material_adjudication_threshold
+            ),
         )
 
         # 评估器
@@ -1075,6 +1309,10 @@ class TrainingPipeline:
             num_games=20, num_simulations=eval_simulations,
             inference_batch_size=inference_batch_size,
             inference_cache_size=self.inference_cache_size,
+            acceptance_threshold=acceptance_threshold,
+            material_adjudication_threshold=(
+                self.material_adjudication_threshold
+            ),
         )
 
     def _save_replay_shard(self, new_data: List[Tuple], iteration: int):
@@ -1173,8 +1411,10 @@ class TrainingPipeline:
         print(f"  MCTS 推理批大小: {self.inference_batch_size}")
         print(f"  自对弈 CPU actors: {self.self_play_workers}")
         print(f"  集中式推理最大 batch: {self.inference_server_batch_size}")
+        print(f"  集中式推理合批等待: {self.inference_server_wait_ms:.1f} ms")
         print(f"  推理缓存容量: {self.inference_cache_size}")
         print(f"  评估 MCTS 模拟次数: {self.eval_simulations}")
+        print(f"  候选模型接受门槛: {self.evaluator.acceptance_threshold:.0%}")
         print(f"  每轮自对弈: {self.self_play_games} 局")
         print(f"  每轮训练 batch 数: {self.training_steps}")
         print(f"  训练批大小: {self.batch_size}")
@@ -1182,6 +1422,11 @@ class TrainingPipeline:
         print(
             f"  近期样本: 末尾 {self.recent_window_size} 条，"
             f"训练占比 {self.recent_sample_fraction:.0%}"
+        )
+        print(f"  和棋样本目标采样占比: {self.draw_sample_fraction:.0%}")
+        print(
+            "  无进展/超时子力裁定阈值: "
+            f"{self.material_adjudication_threshold:.1%}"
         )
         print(f"  数据加载进程: {self.data_workers}")
         print(f"  学习率: {self.learning_rate}")
@@ -1230,6 +1475,8 @@ class TrainingPipeline:
                 sample_weights = build_replay_sample_weights(
                     len(dataset), self.recent_window_size,
                     self.recent_sample_fraction,
+                    sample_values=[sample[-1] for sample in dataset.data],
+                    draw_sample_fraction=self.draw_sample_fraction,
                 )
                 sampler = WeightedRandomSampler(
                     sample_weights,
@@ -1250,6 +1497,12 @@ class TrainingPipeline:
                 print(f"  {self.training_steps} batches: loss={metrics['loss']:.4f}, "
                       f"policy={metrics['policy_loss']:.4f}, "
                       f"value={metrics['value_loss']:.4f}")
+                if metrics['skipped_batches']:
+                    print(
+                        f"  AMP 梯度溢出恢复: 跳过 {metrics['skipped_batches']} 个 batch，"
+                        f"成功更新 {metrics['successful_batches']} 次，"
+                        f"当前 scale={metrics['amp_scale']:.0f}"
+                    )
             else:
                 print(f"  样本不足（需要至少 {self.batch_size * 10}），跳过训练")
             print(f"  网络训练耗时: {time.time() - training_start:.1f} 秒")
@@ -1270,6 +1523,11 @@ class TrainingPipeline:
                 print(f"  候选模型胜: {eval_result['candidate_wins']}, "
                       f"基准模型胜: {eval_result['reference_wins']}, "
                       f"和棋: {eval_result['draws']}")
+                print(f"  评估终局统计: {eval_result['termination_counts']}")
+                print(
+                    "  评估根节点重复走法规避: "
+                    f"{eval_result['repetition_moves_avoided']} 次"
+                )
                 print(f"  模型评估耗时: {time.time() - evaluation_start:.1f} 秒")
 
                 if eval_result['accepted']:

@@ -40,6 +40,7 @@ def cmd_train(args):
         inference_cache_size=args.inference_cache_size,
         self_play_workers=args.self_play_workers,
         inference_server_batch_size=args.inference_server_batch_size,
+        inference_server_wait_ms=args.inference_server_wait_ms,
         eval_simulations=args.eval_simulations,
         self_play_games=args.self_play_games,
         training_steps=args.training_steps,
@@ -49,12 +50,15 @@ def cmd_train(args):
         buffer_size=args.buffer_size,
         recent_window_size=args.recent_window_size,
         recent_sample_fraction=args.recent_sample_fraction,
+        draw_sample_fraction=args.draw_sample_fraction,
+        material_adjudication_threshold=args.material_adjudication_threshold,
         save_dir=args.save_dir,
         resume_from=args.resume,
         load_buffer=args.load_buffer,
         material_warmup=args.material_warmup,
         num_iterations=args.iterations,
         evaluate_every=args.evaluate_every,
+        acceptance_threshold=args.acceptance_threshold,
     )
 
     pipeline.run(num_iterations=args.iterations)
@@ -186,14 +190,22 @@ def main():
         help='当前模型权重的 LRU 局面缓存容量',
     )
     train_parser.add_argument(
-        '--self-play-workers', type=int, default=4,
-        help='并行自对弈 CPU actor 进程数',
+        '--self-play-workers', type=int, default=0,
+        help='并行自对弈 CPU actor 进程数（0=按逻辑核自动）',
     )
     train_parser.add_argument(
         '--inference-server-batch-size', type=int, default=256,
         help='集中式 GPU 推理最大合并 batch',
     )
+    train_parser.add_argument(
+        '--inference-server-wait-ms', type=float, default=5.0,
+        help='集中式 GPU 推理合批等待时间（毫秒）',
+    )
     train_parser.add_argument('--eval-simulations', type=int, default=200, help='模型评估时每步 MCTS 模拟次数')
+    train_parser.add_argument(
+        '--acceptance-threshold', type=float, default=0.50,
+        help='候选模型接受的最低计分率（和棋计 0.5）',
+    )
     train_parser.add_argument('--self-play-games', type=int, default=25, help='每轮自对弈局数')
     train_parser.add_argument('--training-steps', type=int, default=500, help='每轮随机训练 batch 数')
     train_parser.add_argument('--batch-size', type=int, default=256, help='训练批大小')
@@ -210,6 +222,14 @@ def main():
     train_parser.add_argument(
         '--recent-sample-fraction', type=float, default=0.5,
         help='每轮训练从近期数据采样的目标比例（0~1）',
+    )
+    train_parser.add_argument(
+        '--draw-sample-fraction', type=float, default=0.5,
+        help='和棋标签在训练采样中的目标概率（0~1）',
+    )
+    train_parser.add_argument(
+        '--material-adjudication-threshold', type=float, default=0.05,
+        help='无进展或超时时按子力裁定胜负的阈值（0=关闭）',
     )
     train_parser.add_argument('--save-dir', type=str, default='models', help='模型保存目录')
     train_parser.add_argument('--resume', type=str, default=None, help='从指定 checkpoint 继续训练')

@@ -191,7 +191,7 @@ class PolicyValueNet(nn.Module):
 
     def predict_batch(self, board_tensors: List['list']) -> Tuple[np.ndarray, np.ndarray]:
         """批量推理接口；一次 GPU 调用评估多个 MCTS 叶节点。"""
-        if not board_tensors:
+        if len(board_tensors) == 0:
             return (
                 np.empty((0, self.num_moves), dtype=np.float32),
                 np.empty((0,), dtype=np.float32),

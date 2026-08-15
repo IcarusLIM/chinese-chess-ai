@@ -657,20 +657,65 @@ class Game:
         判断是否和棋。
         和棋条件：
         1. 60回合（120半步）无吃子
-        2. 三次重复局面
+        2. 三次重复局面（单方循环将军除外，将军方负）
         """
-        # 60回合无吃子
+        return self.get_adjudicated_result() == 'draw'
+
+    def get_repetition_result(self) -> Optional[str]:
+        """裁定三次重复局面。
+
+        单方在最后一个重复周期内每步都将军时，循环将军方负；
+        其他重复仍按和棋处理。只在已经出现三次重复时回放棋局，
+        不会给普通 MCTS 热路径增加每步将军检查。
+        """
+        if len(self.hash_history) < 5:
+            return None
+        current = self.hash_history[-1]
+        occurrences = [
+            index for index, position_hash in enumerate(self.hash_history)
+            if position_hash == current
+        ]
+        if len(occurrences) < 3:
+            return None
+
+        cycle_start = occurrences[-2]
+        replay = self.copy()
+        move_counts = {True: 0, False: 0}
+        check_counts = {True: 0, False: 0}
+        state_index = len(replay.hash_history) - 1
+        while state_index > cycle_start:
+            checked_side = replay.red_to_move
+            moving_side = not checked_side
+            move_counts[moving_side] += 1
+            if replay.is_in_check(checked_side):
+                check_counts[moving_side] += 1
+            replay.undo_move()
+            state_index -= 1
+
+        perpetual_checkers = [
+            side for side in (True, False)
+            if move_counts[side] > 0 and check_counts[side] == move_counts[side]
+        ]
+        if len(perpetual_checkers) == 1:
+            return 'black_wins' if perpetual_checkers[0] else 'red_wins'
+        return 'draw'
+
+    def get_adjudicated_result(self) -> Optional[str]:
+        """返回不需要生成合法走法的规则裁定结果。"""
+        repetition_result = self.get_repetition_result()
+        if repetition_result is not None:
+            return repetition_result
         if self.halfmove_clock >= 120:
-            return True
-        
-        # 三次重复局面
-        if len(self.hash_history) >= 5:
-            current = self.hash_history[-1]
-            count = sum(1 for h in self.hash_history if h == current)
-            if count >= 3:
-                return True
-        
-        return False
+            return 'draw'
+        return None
+
+    def get_draw_reason(self) -> Optional[str]:
+        """返回当前和棋的可诊断原因。"""
+        if self.get_repetition_result() == 'draw':
+            return 'repetition'
+        if self.halfmove_clock >= 120:
+            return 'no_progress'
+        return None
     
     def is_game_over(self) -> Tuple[bool, Optional[str]]:
         """
@@ -688,9 +733,9 @@ class Game:
             winner = 'black_wins' if self.red_to_move else 'red_wins'
             return (True, winner)
         
-        # 检查和棋
-        if self.is_draw():
-            return (True, 'draw')
+        adjudicated_result = self.get_adjudicated_result()
+        if adjudicated_result is not None:
+            return (True, adjudicated_result)
         
         return (False, None)
     
