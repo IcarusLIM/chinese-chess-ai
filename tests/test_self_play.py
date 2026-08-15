@@ -8,11 +8,15 @@ from constants import B_KING, EMPTY, R_KING, R_ROOK
 from game import Game
 from mcts import InferenceCache, MCTS, search_many
 from move_index import get_move_index
+from encoding import NUM_INPUT_PLANES, canonical_move_index, mirror_index_map
+from network import PolicyValueNet
 from trainer import (
+    GameDataset,
     ModelEvaluator,
     SelfPlayWorker,
     Trainer,
     build_replay_sample_weights,
+    compact_training_sample,
     game_outcome,
     resolve_self_play_workers,
 )
@@ -41,13 +45,13 @@ class TinyTrainingModel(nn.Module):
     def __init__(self, device):
         super().__init__()
         self.policy_bias = nn.Parameter(torch.zeros(2, device=device))
-        self.value_bias = nn.Parameter(torch.zeros(1, device=device))
+        self.value_bias = nn.Parameter(torch.zeros(3, device=device))
 
     def forward(self, states):
         batch_size = states.shape[0]
         return (
             self.policy_bias.expand(batch_size, -1),
-            torch.tanh(self.value_bias).expand(batch_size, 1),
+            self.value_bias.expand(batch_size, -1),
         )
 
 
@@ -109,16 +113,21 @@ class BatchedSelfPlayTests(unittest.TestCase):
         self.assertAlmostEqual(float(normalized[-5000:].sum()), 0.5, places=7)
         self.assertAlmostEqual(float(normalized[:-5000].sum()), 0.5, places=7)
 
-    def test_draw_heavy_replay_is_outcome_balanced(self):
-        values = np.array([0] * 80 + [1, -1] * 10, dtype=np.int8)
-        weights = build_replay_sample_weights(
-            len(values), 20, 0.5, values, draw_sample_fraction=0.5
-        )
-        normalized = weights / weights.sum()
-        self.assertAlmostEqual(
-            float(normalized[torch.as_tensor(values == 0)].sum()), 0.5, places=7
-        )
-        self.assertAlmostEqual(float(normalized[-20:].sum()), 0.5, places=7)
+    def test_compact_samples_keep_fractional_rule_planes(self):
+        game = Game()
+        game.halfmove_clock = 30
+        board = game.get_board_tensor()
+        policy = np.zeros(get_move_index().num_moves, dtype=np.float32)
+        legal_mask = np.zeros_like(policy, dtype=np.bool_)
+        policy[0] = 1.0
+        legal_mask[0] = True
+        sample = compact_training_sample(board, policy, legal_mask, 0)
+
+        state, _, _, value = GameDataset([sample], augment=False)[0]
+
+        self.assertEqual(tuple(state.shape), (NUM_INPUT_PLANES, 10, 9))
+        self.assertAlmostEqual(float(state[17, 0, 0]), 0.25, places=3)
+        self.assertEqual(value.item(), 0)
 
     def test_parallel_actors_use_centralized_inference(self):
         model = UniformModel()
@@ -141,20 +150,20 @@ class BatchedSelfPlayTests(unittest.TestCase):
         import unittest.mock
 
         with unittest.mock.patch('trainer.os.cpu_count', return_value=16):
-            self.assertEqual(resolve_self_play_workers(0, 25), 14)
+            self.assertEqual(resolve_self_play_workers(0, 25), 8)
             self.assertEqual(resolve_self_play_workers(0, 8), 8)
         self.assertEqual(resolve_self_play_workers(6, 4), 4)
 
-    def test_equal_score_candidate_is_not_stuck_in_rollback_loop(self):
+    def test_all_draw_evaluation_does_not_promote_candidate(self):
         evaluator = ModelEvaluator(num_games=2)
         evaluator._play_evaluation_game = lambda *args, **kwargs: (
-            'draw', 'repetition', 0
+            'draw', 'repetition'
         )
 
         result = evaluator.evaluate(object(), object())
 
         self.assertEqual(result['score_rate'], 0.5)
-        self.assertTrue(result['accepted'])
+        self.assertFalse(result['accepted'])
         self.assertEqual(result['termination_counts'], {'repetition': 2})
 
     def test_perpetual_checker_loses_repetition(self):
@@ -183,26 +192,49 @@ class BatchedSelfPlayTests(unittest.TestCase):
         self.assertEqual(game.get_repetition_result(), 'black_wins')
         self.assertEqual(game.is_game_over(), (True, 'black_wins'))
 
-    def test_mcts_avoids_returning_to_history_when_not_behind(self):
-        game = Game()
-        game.make_move((0, 1), (2, 2))
-        game.make_move((9, 1), (7, 2))
-        game.make_move((2, 2), (0, 1))
-        history_before = game.hash_history[:]
+    def test_canonical_black_move_rotates_180_degrees(self):
         move_index = get_move_index()
-        legal_indices = [
-            move_index.move_to_index((fr, fc, tr, tc))
-            for (fr, fc), (tr, tc) in game.get_legal_moves()
-        ]
-        repeating_move = move_index.move_to_index((7, 2, 9, 1))
-        mcts = MCTS(UniformModel(), num_simulations=2)
+        absolute = (0, 1, 2, 2)
+        canonical = (9, 7, 7, 6)
+        self.assertEqual(
+            canonical_move_index(absolute, red_to_move=False),
+            move_index.move_to_index(canonical),
+        )
 
-        candidates = mcts._non_repeating_root_moves(game, legal_indices)
+    def test_initial_position_is_side_canonical(self):
+        red_view = Game().get_board_tensor()
+        black_game = Game()
+        black_game.red_to_move = False
+        black_game.current_hash = black_game._compute_hash()
+        black_game.hash_history = [black_game.current_hash]
 
-        self.assertIn(repeating_move, legal_indices)
-        self.assertNotIn(repeating_move, candidates)
-        self.assertEqual(game.hash_history, history_before)
-        self.assertGreater(mcts.repetition_moves_avoided, 0)
+        self.assertTrue(np.array_equal(red_view, black_game.get_board_tensor()))
+
+    def test_mirror_move_map_is_an_involution(self):
+        mapping = mirror_index_map()
+        self.assertTrue(np.array_equal(mapping[mapping], np.arange(len(mapping))))
+
+    def test_default_network_is_compact_and_outputs_wdl(self):
+        model = PolicyValueNet()
+        policy, wdl = model(torch.zeros(2, NUM_INPUT_PLANES, 10, 9))
+        self.assertEqual(policy.shape, (2, get_move_index().num_moves))
+        self.assertEqual(wdl.shape, (2, 3))
+        self.assertLess(model.count_parameters(), 4_000_000)
+
+    def test_wdl_training_step_is_finite(self):
+        model = TinyTrainingModel(torch.device('cpu'))
+        trainer = Trainer(model, total_training_iterations=2)
+        batch = (
+            torch.zeros(3, NUM_INPUT_PLANES, 10, 9),
+            torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]]),
+            torch.ones(3, 2, dtype=torch.bool),
+            torch.tensor([-1, 0, 1], dtype=torch.long),
+        )
+
+        metrics = trainer.train_iteration([batch], iteration=1)
+
+        self.assertTrue(np.isfinite(metrics['loss']))
+        self.assertEqual(metrics['successful_batches'], 1)
 
     def test_move_limit_uses_material_adjudication(self):
         game = Game()
@@ -223,10 +255,10 @@ class BatchedSelfPlayTests(unittest.TestCase):
         device = torch.device('cuda')
         model = TinyTrainingModel(device)
         trainer = Trainer(model, total_training_iterations=10)
-        states = torch.zeros((2, 15, 10, 9))
+        states = torch.zeros((2, NUM_INPUT_PLANES, 10, 9))
         policies = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         legal_masks = torch.ones((2, 2), dtype=torch.bool)
-        values = torch.zeros(2)
+        values = torch.zeros(2, dtype=torch.long)
         batches = [
             (states, policies, legal_masks, values),
             (states, policies, legal_masks, values),

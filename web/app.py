@@ -185,7 +185,7 @@ def init_ai(model_path: str = None, num_simulations: int = 200,
             raise FileNotFoundError(f"模型文件不存在: {model_path}")
         model = create_model_from_checkpoint(model_path, device)
     else:
-        model = create_model(num_blocks=10, channels=256, device=device)
+        model = create_model(device=device)
         print(f"[Web] 未指定模型文件，使用随机初始化（AI 走子将随机）")
     
     ai_evaluator = MCTSEvaluator(

@@ -793,30 +793,9 @@ class Game:
         return fen
     
     def get_board_tensor(self) -> np.ndarray:
-        """
-        将棋盘状态编码为神经网络输入格式。
-
-        使用 15 个通道（plane），每个通道是一个 10x9 的矩阵：
-        - 通道 0-6：红方的 帅、仕、相、马、车、炮、兵（二值）
-        - 通道 7-13：黑方的 将、士、象、马、车、炮、卒（二值）
-        - 通道 14：当前走棋方（红方走棋全 1，黑方走棋全 0）
-
-        Returns:
-            float32 格式的 15x10x9 NumPy 数组
-        """
-        tensor = np.zeros((15, BOARD_ROWS, BOARD_COLS), dtype=np.float32)
-
-        for row in range(BOARD_ROWS):
-            for col in range(BOARD_COLS):
-                piece = self.board[row][col]
-                if piece != EMPTY:
-                    channel = piece - 1  # 编码 1-14 → 通道 0-13
-                    tensor[channel, row, col] = 1.0
-
-        # 第 15 通道：当前走棋方
-        tensor[14, :, :] = 1.0 if self.red_to_move else 0.0
-
-        return tensor
+        """返回当前走棋方视角的 19 通道训练状态。"""
+        from encoding import encode_game
+        return encode_game(self)
     
     def copy(self) -> 'Game':
         """创建游戏状态的深拷贝"""

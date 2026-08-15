@@ -32,6 +32,7 @@ from typing import Dict, List, Tuple, Optional
 from game import Game
 from network import PolicyValueNet
 from move_index import get_move_index
+from encoding import canonical_move_index, inference_cache_key
 
 
 class InferenceCache:
@@ -43,7 +44,7 @@ class InferenceCache:
         self.hits = 0
         self.misses = 0
 
-    def get(self, position_hash: int):
+    def get(self, position_hash):
         if self.max_size <= 0 or position_hash not in self._data:
             self.misses += 1
             return None
@@ -52,7 +53,7 @@ class InferenceCache:
         self._data[position_hash] = value
         return value
 
-    def put(self, position_hash: int, policy, value: float):
+    def put(self, position_hash, policy, value: float):
         if self.max_size <= 0:
             return
         if position_hash in self._data:
@@ -203,10 +204,7 @@ class MCTS:
                  add_root_noise: bool = False,
                  inference_batch_size: int = 64,
                  virtual_loss: float = 1.0,
-                 inference_cache: Optional[InferenceCache] = None,
-                 material_weight: float = 0.0,
-                 avoid_repetition: bool = True,
-                 repetition_material_threshold: float = -1.0):
+                 inference_cache: Optional[InferenceCache] = None):
         """
         Args:
             model: 策略-价值网络
@@ -224,9 +222,6 @@ class MCTS:
             inference_batch_size: 每次 GPU 推理合并的叶节点数
             virtual_loss: 批内选择时的临时损失，用于分散搜索路径
             inference_cache: 与当前模型权重绑定的共享推理缓存
-            material_weight: 材料评估混合权重（0.0=纯网络，1.0=纯材料评估）
-            avoid_repetition: 有其他选择时避免主动走回历史局面
-            repetition_material_threshold: 启用重复规避的最低材料评估
         """
         if num_simulations < 1:
             raise ValueError("num_simulations 必须大于 0")
@@ -239,16 +234,12 @@ class MCTS:
         self.inference_batch_size = max(1, inference_batch_size)
         self.virtual_loss = virtual_loss
         self.inference_cache = inference_cache
-        self.material_weight = material_weight
-        self.avoid_repetition = avoid_repetition
-        self.repetition_material_threshold = repetition_material_threshold
         self.move_index = get_move_index()
         self._cached_root: Optional[MCTSNode] = None
-        self._cached_root_hash: Optional[int] = None
+        self._cached_root_hash = None
         self.last_legal_indices: List[int] = []
         self.inference_calls = 0
         self.inference_positions = 0
-        self.repetition_moves_avoided = 0
     
     def search(self, game: Game, temperature: float = 1.0) -> Tuple[int, List[float]]:
         """
@@ -272,7 +263,8 @@ class MCTS:
 
         # 当前局面若正好是上一步选中后的子节点，则复用整棵子树。
         reused_root = (
-            self._cached_root is not None and self._cached_root_hash == game.current_hash
+            self._cached_root is not None
+            and self._cached_root_hash == inference_cache_key(game)
         )
         if reused_root:
             root = self._cached_root
@@ -286,15 +278,19 @@ class MCTS:
             return -1, [0.0] * self.move_index.num_moves
 
         legal_indices = self._legal_indices(legal_moves)
+        policy_indices = self._policy_indices(legal_moves, game.red_to_move)
         self.last_legal_indices = legal_indices
         if not legal_indices:
             return -1, [0.0] * self.move_index.num_moves
 
         if not root.is_expanded:
             policies, _ = self._predict_with_cache(
-                [game.get_board_tensor()], [game.current_hash]
+                [game.get_board_tensor()], [inference_cache_key(game)]
             )
-            root.expand(legal_indices, self._normalized_priors(policies[0], legal_indices))
+            root.expand(
+                legal_indices,
+                self._normalized_priors(policies[0], policy_indices),
+            )
 
         # 根节点噪声只用于自对弈；推理和模型评估保持确定性。
         if self.add_root_noise:
@@ -328,7 +324,7 @@ class MCTS:
             fr, fc, tr, tc = move
             game.make_move((fr, fc), (tr, tc), validate=False)
             self._cached_root = root.children[best_move]
-            self._cached_root_hash = game.current_hash
+            self._cached_root_hash = inference_cache_key(game)
             game.undo_move()
 
         return best_move, policy
@@ -340,7 +336,8 @@ class MCTS:
             return {'finished': True, 'result': (-1, [0.0] * self.move_index.num_moves)}
 
         reused_root = (
-            self._cached_root is not None and self._cached_root_hash == game.current_hash
+            self._cached_root is not None
+            and self._cached_root_hash == inference_cache_key(game)
         )
         root = self._cached_root if reused_root else MCTSNode()
         legal_moves = game.get_legal_moves()
@@ -349,6 +346,7 @@ class MCTS:
             return {'finished': True, 'result': (-1, [0.0] * self.move_index.num_moves)}
 
         legal_indices = self._legal_indices(legal_moves)
+        policy_indices = self._policy_indices(legal_moves, game.red_to_move)
         self.last_legal_indices = legal_indices
         if not legal_indices:
             return {'finished': True, 'result': (-1, [0.0] * self.move_index.num_moves)}
@@ -359,6 +357,7 @@ class MCTS:
             'temperature': temperature,
             'root': root,
             'legal_indices': legal_indices,
+            'policy_indices': policy_indices,
             'reused_root': reused_root,
             'needs_root_evaluation': not root.is_expanded,
         }
@@ -378,7 +377,7 @@ class MCTS:
             fr, fc, tr, tc = move
             game.make_move((fr, fc), (tr, tc), validate=False)
             self._cached_root = root.children[best_move]
-            self._cached_root_hash = game.current_hash
+            self._cached_root_hash = inference_cache_key(game)
             game.undo_move()
         return best_move, policy
 
@@ -409,25 +408,28 @@ class MCTS:
         if metadata is None:
             legal_moves = game.get_legal_moves()
             legal_indices = self._legal_indices(legal_moves)
+            policy_indices = self._policy_indices(legal_moves, game.red_to_move)
             if not legal_indices:
-                metadata = {'legal_indices': legal_indices, 'value': -1.0}
+                metadata = {
+                    'legal_indices': legal_indices,
+                    'policy_indices': policy_indices,
+                    'value': -1.0,
+                }
             else:
                 terminal_result = game.get_adjudicated_result()
                 if terminal_result is not None:
                     metadata = {
                         'legal_indices': legal_indices,
+                        'policy_indices': policy_indices,
                         'value': self._result_value(game, terminal_result),
                     }
                 else:
                     metadata = {
                         'legal_indices': legal_indices,
+                        'policy_indices': policy_indices,
                         'value': None,
                         'state': game.get_board_tensor(),
-                        'position_hash': game.current_hash,
-                        'material_value': (
-                            game.evaluate_material_normalized()
-                            if self.material_weight > 0 else 0.0
-                        ),
+                        'position_hash': inference_cache_key(game),
                     }
             leaf_metadata[leaf_key] = metadata
 
@@ -449,15 +451,11 @@ class MCTS:
 
         metadata = record['metadata']
         if metadata['value'] is None:
-            network_value = metadata['network_value']
-            value = (
-                (1 - self.material_weight) * network_value
-                + self.material_weight * metadata['material_value']
-            )
+            value = metadata['network_value']
             record['node'].expand(
                 metadata['legal_indices'],
                 self._normalized_priors(
-                    metadata['policy_probs'], metadata['legal_indices']
+                    metadata['policy_probs'], metadata['policy_indices']
                 ),
             )
         else:
@@ -497,38 +495,33 @@ class MCTS:
             if metadata is None:
                 legal_moves = game.get_legal_moves()
                 legal_indices = self._legal_indices(legal_moves)
+                policy_indices = self._policy_indices(legal_moves, game.red_to_move)
                 if not legal_indices:
                     value = -1.0
                     prediction_index = None
-                    material_value = 0.0
                 else:
                     terminal_result = game.get_adjudicated_result()
                     if terminal_result is not None:
                         value = self._result_value(game, terminal_result)
                         prediction_index = None
-                        material_value = 0.0
                     else:
                         value = None
                         prediction_index = len(pending_states)
                         pending_states.append(game.get_board_tensor())
-                        pending_hashes.append(game.current_hash)
-                        material_value = (
-                            game.evaluate_material_normalized()
-                            if self.material_weight > 0 else 0.0
-                        )
-                metadata = (legal_indices, value, prediction_index, material_value)
+                        pending_hashes.append(inference_cache_key(game))
+                metadata = (legal_indices, policy_indices, value, prediction_index)
                 leaf_metadata[leaf_key] = metadata
             else:
-                legal_indices, value, prediction_index, material_value = metadata
+                legal_indices, policy_indices, value, prediction_index = metadata
 
             records.append({
                 'node': node,
                 'path': search_path,
                 'virtual_edges': virtual_edges,
                 'legal_indices': legal_indices,
+                'policy_indices': policy_indices,
                 'value': value,
                 'prediction_index': prediction_index,
-                'material_value': material_value,
             })
 
             for _ in range(len(search_path) - 1):
@@ -548,14 +541,11 @@ class MCTS:
             prediction_index = record['prediction_index']
             if prediction_index is not None:
                 policy_probs = policy_batch[prediction_index]
-                network_value = float(value_batch[prediction_index])
-                value = (
-                    (1 - self.material_weight) * network_value
-                    + self.material_weight * record['material_value']
-                )
+                value = float(value_batch[prediction_index])
                 legal_indices = record['legal_indices']
                 record['node'].expand(
-                    legal_indices, self._normalized_priors(policy_probs, legal_indices)
+                    legal_indices,
+                    self._normalized_priors(policy_probs, record['policy_indices']),
                 )
             else:
                 value = record['value']
@@ -629,6 +619,13 @@ class MCTS:
         return indices
 
     @staticmethod
+    def _policy_indices(legal_moves: list, red_to_move: bool) -> List[int]:
+        return [
+            canonical_move_index((fr, fc, tr, tc), red_to_move)
+            for (fr, fc), (tr, tc) in legal_moves
+        ]
+
+    @staticmethod
     def _normalized_priors(policy_probs, legal_indices: List[int]) -> List[float]:
         priors = [float(policy_probs[idx]) for idx in legal_indices]
         prior_sum = sum(priors)
@@ -638,8 +635,8 @@ class MCTS:
     
     def _select_root_move(self, game: Game, root: MCTSNode,
                           legal_indices: List[int], temperature: float):
-        """在实际落子前根据对局历史排除主动重复。"""
-        candidates = self._non_repeating_root_moves(game, legal_indices)
+        """根据根节点访问次数选择实际走法。"""
+        candidates = legal_indices
         policy = self._compute_policy(root, temperature, candidates)
         if temperature <= 0.01:
             best_move = max(candidates, key=lambda move_idx: root.N.get(move_idx, 0))
@@ -651,35 +648,6 @@ class MCTS:
             probabilities = self._temperature_probs(visits, temperature)
             best_move = candidates[np.random.choice(len(candidates), p=probabilities)]
         return best_move, policy
-
-    def _non_repeating_root_moves(self, game: Game,
-                                  legal_indices: List[int]) -> List[int]:
-        """返回不会立即回到历史局面的根走法。"""
-        if (
-            not self.avoid_repetition
-            or len(game.hash_history) < 2
-            or game.evaluate_material_normalized()
-            < self.repetition_material_threshold
-        ):
-            return legal_indices
-
-        historical_hashes = set(game.hash_history)
-        non_repeating = []
-        for move_idx in legal_indices:
-            move = self.move_index.index_to_move(move_idx)
-            if move is None:
-                continue
-            fr, fc, tr, tc = move
-            game.make_move((fr, fc), (tr, tc), validate=False)
-            repeats = game.current_hash in historical_hashes
-            game.undo_move()
-            if not repeats:
-                non_repeating.append(move_idx)
-
-        if non_repeating and len(non_repeating) < len(legal_indices):
-            self.repetition_moves_avoided += len(legal_indices) - len(non_repeating)
-            return non_repeating
-        return legal_indices
 
     def _compute_policy(self, root: MCTSNode, temperature: float,
                         move_indices: Optional[List[int]] = None) -> List[float]:
@@ -769,12 +737,12 @@ def search_many(requests: List[Tuple[MCTS, Game, float]],
         predictor = root_contexts[0]['mcts']
         policies, _ = predictor._predict_with_cache(
             [c['game'].get_board_tensor() for c in root_contexts],
-            [c['game'].current_hash for c in root_contexts],
+            [inference_cache_key(c['game']) for c in root_contexts],
         )
         for context, policy in zip(root_contexts, policies):
             context['root'].expand(
                 context['legal_indices'],
-                context['mcts']._normalized_priors(policy, context['legal_indices']),
+                context['mcts']._normalized_priors(policy, context['policy_indices']),
             )
 
     for context in active:

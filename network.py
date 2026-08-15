@@ -7,10 +7,7 @@
   输入 → 卷积层 → 残差块 × N → 策略头 + 价值头
 
   - 策略头（Policy Head）：输出每个走法的概率分布
-  - 价值头（Value Head）：输出当前局面的评估值 [-1, 1]
-    - +1 表示当前走棋方占优/获胜
-    - -1 表示当前走棋方劣势/失败
-    - 0 表示均势
+  - 价值头（WDL Head）：输出当前走棋方的负/和/胜概率
 
 设计选择：
   - 使用 ResNet 残差块而非纯 Transformer，因为：
@@ -31,6 +28,7 @@ import torch.nn.functional as F
 import numpy as np
 from typing import List, Tuple
 from constants import BOARD_ROWS, BOARD_COLS
+from encoding import NUM_INPUT_PLANES
 from move_index import get_move_index
 
 
@@ -84,21 +82,20 @@ class PolicyValueNet(nn.Module):
     """
     策略-价值网络
     
-    输入：棋盘状态张量 [batch, 15, 10, 9]
-      - 15 个通道：红方7种棋子 + 黑方7种棋子 + 当前走棋方
-      - 每个通道是该种棋子的位置热力图
+    输入：当前走棋方视角的状态张量 [batch, 19, 10, 9]
     
     输出：
       - policy: [batch, num_moves] 走法概率分布
-      - value: [batch, 1] 局面评估值 [-1, 1]
+      - wdl: [batch, 3] 负/和/胜 logits
     
     网络结构：
-      输入(15通道) → Conv2d(256) → ResBlock×10 →
-        ├→ 策略头: Conv(32) → FC(num_moves) → policy
-        └→ 价值头: Conv(3) → FC(256) → FC(1) → tanh → value
+      输入(19通道) → Conv2d(128) → ResBlock×6 →
+        ├→ 策略头: Conv(4) → FC(num_moves)
+        └→ WDL 头: Conv(3) → FC(256) → FC(3)
     """
     
-    def __init__(self, num_blocks: int = 10, channels: int = 256):
+    def __init__(self, num_blocks: int = 6, channels: int = 128,
+                 policy_channels: int = 4):
         """
         Args:
             num_blocks: 残差块数量（更多块 = 更强但更慢）
@@ -107,15 +104,16 @@ class PolicyValueNet(nn.Module):
         super().__init__()
         self.num_blocks = num_blocks
         self.channels = channels
+        self.policy_channels = policy_channels
         
         # 获取走法总数（网络输出维度）
         mi = get_move_index()
         self.num_moves = mi.num_moves
         
         # === 输入层 ===
-        # 将 15 通道的棋盘状态映射到高维特征空间（14 棋子 + 1 走棋方）
+        # 将规范化棋盘、上一步和规则状态映射到特征空间。
         self.input_conv = nn.Sequential(
-            nn.Conv2d(15, channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(NUM_INPUT_PLANES, channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(),
         )
@@ -130,15 +128,15 @@ class PolicyValueNet(nn.Module):
         # 输出每个走法的概率
         # 使用 1×1 卷积降低通道数，然后全连接到走法数
         self.policy_head = nn.Sequential(
-            nn.Conv2d(channels, 32, kernel_size=1, bias=False),  # 降维
-            nn.BatchNorm2d(32),
+            nn.Conv2d(channels, policy_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(policy_channels),
             nn.ReLU(),
-            nn.Flatten(),                    # 展平：32 × 10 × 9 = 2880
-            nn.Linear(32 * BOARD_ROWS * BOARD_COLS, self.num_moves),  # 全连接
+            nn.Flatten(),
+            nn.Linear(policy_channels * BOARD_ROWS * BOARD_COLS, self.num_moves),
         )
         
         # === 价值头（Value Head） ===
-        # 输出局面评估值 [-1, 1]
+        # 从当前走棋方视角输出 [loss, draw, win] logits。
         self.value_head = nn.Sequential(
             nn.Conv2d(channels, 3, kernel_size=1, bias=False),
             nn.BatchNorm2d(3),
@@ -146,8 +144,7 @@ class PolicyValueNet(nn.Module):
             nn.Flatten(),                    # 展平：3 × 10 × 9 = 270
             nn.Linear(3 * BOARD_ROWS * BOARD_COLS, 256),
             nn.ReLU(),
-            nn.Linear(256, 1),               # 输出单个标量
-            nn.Tanh(),                       # 限制在 [-1, 1]
+            nn.Linear(256, 3),
         )
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -155,12 +152,12 @@ class PolicyValueNet(nn.Module):
         前向传播。
         
         Args:
-            x: 棋盘状态张量 [batch, 15, 10, 9]
+            x: 棋盘状态张量 [batch, 19, 10, 9]
             
         Returns:
-            (policy, value):
+            (policy, wdl):
             - policy: [batch, num_moves] 走法概率（未经 softmax）
-            - value: [batch, 1] 局面评估 [-1, 1]
+            - wdl: [batch, 3] 负/和/胜 logits
         """
         # 提取特征
         features = self.input_conv(x)
@@ -170,16 +167,16 @@ class PolicyValueNet(nn.Module):
         policy = self.policy_head(features)
         
         # 价值头：输出局面评估
-        value = self.value_head(features)
+        wdl = self.value_head(features)
         
-        return policy, value
+        return policy, wdl
     
     def predict(self, board_tensor: 'list') -> Tuple[list, float]:
         """
         单个局面的推理接口（不使用 DataLoader）。
         
         Args:
-            board_tensor: 15×10×9 的三维列表（来自 Game.get_board_tensor()）
+            board_tensor: 19×10×9 的三维数组（来自 Game.get_board_tensor()）
             
         Returns:
             (policy_probs, value):
@@ -207,12 +204,14 @@ class PolicyValueNet(nn.Module):
         with torch.inference_mode(), torch.amp.autocast(
             'cuda', dtype=torch.float16, enabled=use_amp
         ):
-            policy_logits, values = self.forward(x)
+            policy_logits, wdl_logits = self.forward(x)
             policy_probs = F.softmax(policy_logits, dim=1)
+            wdl_probs = F.softmax(wdl_logits, dim=1)
 
         # 每个 batch 只同步一次 GPU；有限值检查在 CPU 上完成。
         policies_cpu = policy_probs.float().cpu().numpy()
-        values_cpu = values.squeeze(-1).float().cpu().numpy()
+        wdl_cpu = wdl_probs.float().cpu().numpy()
+        values_cpu = wdl_cpu[:, 2] - wdl_cpu[:, 0]
         if not np.isfinite(policies_cpu).all() or not np.isfinite(values_cpu).all():
             raise FloatingPointError("模型推理输出出现 NaN/Inf，请勿继续使用该检查点")
         return policies_cpu, values_cpu
@@ -229,6 +228,7 @@ class PolicyValueNet(nn.Module):
             f"PolicyValueNet:\n"
             f"  残差块数: {self.num_blocks}\n"
             f"  特征通道: {self.channels}\n"
+            f"  策略头通道: {self.policy_channels}\n"
             f"  走法数量: {self.num_moves}\n"
             f"  总参数量: {total_params:,}\n"
             f"  可训练参数: {trainable_params:,}\n"
@@ -245,8 +245,8 @@ def get_default_device() -> str:
     return 'cpu'
 
 
-def create_model(num_blocks: int = 10, channels: int = 256,
-                 device: str = None) -> PolicyValueNet:
+def create_model(num_blocks: int = 6, channels: int = 128,
+                 policy_channels: int = 4, device: str = None) -> PolicyValueNet:
     """
     创建并初始化策略-价值网络。
     
@@ -265,7 +265,11 @@ def create_model(num_blocks: int = 10, channels: int = 256,
         初始化好的 PolicyValueNet 模型
     """
     device = device or get_default_device()
-    model = PolicyValueNet(num_blocks=num_blocks, channels=channels)
+    model = PolicyValueNet(
+        num_blocks=num_blocks,
+        channels=channels,
+        policy_channels=policy_channels,
+    )
     
     # 移动到 GPU
     if device == 'cuda' and torch.cuda.is_available():
@@ -301,6 +305,7 @@ def create_model_from_checkpoint(path: str, device: str) -> PolicyValueNet:
     model = create_model(
         num_blocks=config['num_blocks'],
         channels=config['channels'],
+        policy_channels=config['policy_channels'],
         device=device,
     )
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -312,16 +317,15 @@ def create_model_from_checkpoint(path: str, device: str) -> PolicyValueNet:
 if __name__ == '__main__':
     # 测试：创建模型并进行一次前向传播
     device = get_default_device()
-    model = create_model(num_blocks=5, channels=128, device=device)
+    model = create_model(device=device)
     
     # 模拟输入
-    dummy_input = torch.randn(1, 15, BOARD_ROWS, BOARD_COLS)
+    dummy_input = torch.randn(1, NUM_INPUT_PLANES, BOARD_ROWS, BOARD_COLS)
     if device != 'cpu':
         dummy_input = dummy_input.to(device)
     dummy_input = dummy_input.to(memory_format=torch.channels_last)
     
-    policy, value = model(dummy_input)
+    policy, wdl = model(dummy_input)
     print(f"\n测试前向传播:")
     print(f"  策略输出形状: {policy.shape}")
-    print(f"  价值输出形状: {value.shape}")
-    print(f"  价值输出: {value.item():.4f}")
+    print(f"  WDL 输出形状: {wdl.shape}")

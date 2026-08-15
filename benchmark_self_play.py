@@ -21,7 +21,10 @@ def main():
     parser.add_argument('--server-wait-ms', type=float, default=5.0)
     args = parser.parse_args()
 
-    model = create_model(args.blocks, args.channels, device=get_default_device())
+    model = create_model(
+        args.blocks, args.channels, policy_channels=4,
+        device=get_default_device(),
+    )
     common = dict(
         num_simulations=args.simulations,
         inference_batch_size=args.batch_size,

@@ -8,7 +8,6 @@
 
 用法：
   python main.py train                                        # 从零开始训练
-  python main.py train --material-warmup 80                   # 启用材料评估 warmup
   python main.py train --resume models/latest_model.pt        # 从 checkpoint 续训
   python main.py train --iterations 50                        # 训练50轮
   python main.py web                                          # 启动 Web 界面
@@ -35,27 +34,31 @@ def cmd_train(args):
     pipeline = TrainingPipeline(
         num_blocks=args.blocks,
         channels=args.channels,
+        policy_channels=args.policy_channels,
         num_simulations=args.simulations,
+        initial_simulations=args.initial_simulations,
+        simulation_ramp_iterations=args.simulation_ramp_iterations,
         inference_batch_size=args.inference_batch_size,
         inference_cache_size=args.inference_cache_size,
         self_play_workers=args.self_play_workers,
         inference_server_batch_size=args.inference_server_batch_size,
         inference_server_wait_ms=args.inference_server_wait_ms,
         eval_simulations=args.eval_simulations,
+        eval_games=args.eval_games,
         self_play_games=args.self_play_games,
-        training_steps=args.training_steps,
+        replay_ratio=args.replay_ratio,
+        min_training_steps=args.min_training_steps,
+        max_training_steps=args.max_training_steps,
         batch_size=args.batch_size,
         data_workers=args.data_workers,
         learning_rate=args.lr,
         buffer_size=args.buffer_size,
         recent_window_size=args.recent_window_size,
         recent_sample_fraction=args.recent_sample_fraction,
-        draw_sample_fraction=args.draw_sample_fraction,
         material_adjudication_threshold=args.material_adjudication_threshold,
         save_dir=args.save_dir,
         resume_from=args.resume,
         load_buffer=args.load_buffer,
-        material_warmup=args.material_warmup,
         num_iterations=args.iterations,
         evaluate_every=args.evaluate_every,
         acceptance_threshold=args.acceptance_threshold,
@@ -106,7 +109,7 @@ def cmd_play(args):
             raise FileNotFoundError(f"模型文件不存在: {args.model}")
         model = create_model_from_checkpoint(args.model, device)
     else:
-        model = create_model(num_blocks=10, channels=256, device=device)
+        model = create_model(device=device)
 
     evaluator = MCTSEvaluator(
         model, num_simulations=args.simulations,
@@ -163,7 +166,6 @@ def main():
         epilog="""
 示例：
   python main.py train                                        # 从零开始训练
-  python main.py train --material-warmup 80                   # 启用 80 轮材料评估 warmup
   python main.py train --resume models/latest_model.pt        # 从 checkpoint 续训
   python main.py train --iterations 50 --blocks 5             # 快速训练
   python main.py web                                          # 启动 Web 界面
@@ -177,10 +179,13 @@ def main():
     # === train 子命令 ===
     train_parser = subparsers.add_parser('train', help='自对弈训练')
     train_parser.add_argument('--iterations', type=int, default=100, help='训练迭代次数')
-    train_parser.add_argument('--evaluate-every', type=int, default=2, help='每隔多少轮评估一次')
-    train_parser.add_argument('--blocks', type=int, default=10, help='残差块数量')
-    train_parser.add_argument('--channels', type=int, default=256, help='特征通道数')
+    train_parser.add_argument('--evaluate-every', type=int, default=5, help='每隔多少轮评估一次')
+    train_parser.add_argument('--blocks', type=int, default=6, help='残差块数量')
+    train_parser.add_argument('--channels', type=int, default=128, help='特征通道数')
+    train_parser.add_argument('--policy-channels', type=int, default=4, help='策略头通道数')
     train_parser.add_argument('--simulations', type=int, default=400, help='MCTS 模拟次数')
+    train_parser.add_argument('--initial-simulations', type=int, default=100, help='初始 MCTS 模拟次数')
+    train_parser.add_argument('--simulation-ramp-iterations', type=int, default=30, help='模拟次数线性增长轮数')
     train_parser.add_argument(
         '--inference-batch-size', type=int, default=64,
         help='MCTS GPU 叶节点推理批大小',
@@ -202,21 +207,24 @@ def main():
         help='集中式 GPU 推理合批等待时间（毫秒）',
     )
     train_parser.add_argument('--eval-simulations', type=int, default=200, help='模型评估时每步 MCTS 模拟次数')
+    train_parser.add_argument('--eval-games', type=int, default=20, help='每次模型评估对弈局数（偶数）')
     train_parser.add_argument(
-        '--acceptance-threshold', type=float, default=0.50,
+        '--acceptance-threshold', type=float, default=0.55,
         help='候选模型接受的最低计分率（和棋计 0.5）',
     )
-    train_parser.add_argument('--self-play-games', type=int, default=25, help='每轮自对弈局数')
-    train_parser.add_argument('--training-steps', type=int, default=500, help='每轮随机训练 batch 数')
+    train_parser.add_argument('--self-play-games', type=int, default=32, help='每轮自对弈局数')
+    train_parser.add_argument('--replay-ratio', type=float, default=4.0, help='每条新样本的目标重放次数')
+    train_parser.add_argument('--min-training-steps', type=int, default=32, help='每轮最少训练 batch 数')
+    train_parser.add_argument('--max-training-steps', type=int, default=128, help='每轮最多训练 batch 数')
     train_parser.add_argument('--batch-size', type=int, default=256, help='训练批大小')
     train_parser.add_argument('--data-workers', type=int, default=4, help='训练数据加载进程数')
-    train_parser.add_argument('--lr', type=float, default=0.001, help='学习率')
+    train_parser.add_argument('--lr', type=float, default=3e-4, help='学习率')
     train_parser.add_argument(
-        '--buffer-size', type=int, default=20000,
+        '--buffer-size', type=int, default=50000,
         help='Replay buffer 最近样本窗口大小',
     )
     train_parser.add_argument(
-        '--recent-window-size', type=int, default=5000,
+        '--recent-window-size', type=int, default=10000,
         help='分层采样中视为近期数据的末尾样本数',
     )
     train_parser.add_argument(
@@ -224,11 +232,7 @@ def main():
         help='每轮训练从近期数据采样的目标比例（0~1）',
     )
     train_parser.add_argument(
-        '--draw-sample-fraction', type=float, default=0.5,
-        help='和棋标签在训练采样中的目标概率（0~1）',
-    )
-    train_parser.add_argument(
-        '--material-adjudication-threshold', type=float, default=0.05,
+        '--material-adjudication-threshold', type=float, default=0.10,
         help='无进展或超时时按子力裁定胜负的阈值（0=关闭）',
     )
     train_parser.add_argument('--save-dir', type=str, default='models', help='模型保存目录')
@@ -236,10 +240,6 @@ def main():
     train_parser.add_argument(
         '--load-buffer', type=str, default=None,
         help='从 replay 目录或 manifest 加载数据',
-    )
-    train_parser.add_argument(
-        '--material-warmup', type=int, default=80,
-        help='材料评估 warmup 迭代数（默认 80，0=不启用）',
     )
     
     # === web 子命令 ===
